@@ -28,6 +28,7 @@ class FlowerClient(NumPyClient):
 
     def fit(self, parameters, config):
         local_epochs = config["local_epochs"]
+        proximal_mu = config["proximal_mu"]
         set_weights(self.net, parameters)
         # Pass both training dataloaders to the train function
         train_loss = train(
@@ -36,6 +37,7 @@ class FlowerClient(NumPyClient):
             self.trainloader_freq,
             local_epochs,
             self.device,
+            proximal_mu,
         )
         # Return the total number of training samples
         num_examples = len(self.trainloader_time.dataset) + len(self.trainloader_freq.dataset)

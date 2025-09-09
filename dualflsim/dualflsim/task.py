@@ -83,9 +83,12 @@ def my_kl_loss(p, q):
     return torch.mean(torch.sum(res, dim=-1), dim=1)
 
 
-def train(net, trainloader_time, trainloader_freq, epochs, device, k=3.0, lr=1e-4):
-    """Train the complete DualTF model."""
+def train(net, trainloader_time, trainloader_freq, epochs, device, proximal_mu, k=3.0, lr=1e-4):
+    """Train the complete DualTF model with FedProx."""
     
+    # Store initial weights for FedProx
+    global_params = [param.clone() for param in net.parameters()]
+
     # --- Train Time Model ---
     time_model = net.time_model
     time_model.to(device)
@@ -109,6 +112,15 @@ def train(net, trainloader_time, trainloader_freq, epochs, device, k=3.0, lr=1e-
             rec_loss = time_criterion(output, input_data)
             loss1 = rec_loss - k * series_loss
             loss2 = rec_loss + k * prior_loss
+
+            # Add FedProx proximal term
+            proximal_term = 0.0
+            for local_param, global_param in zip(time_model.parameters(), global_params[:len(list(time_model.parameters()))]):
+                proximal_term += (local_param - global_param).pow(2).sum()
+            
+            loss1 += (proximal_mu / 2) * proximal_term
+            loss2 += (proximal_mu / 2) * proximal_term
+
             loss1.backward(retain_graph=True)
             loss2.backward()
             time_optimizer.step()
@@ -138,6 +150,17 @@ def train(net, trainloader_time, trainloader_freq, epochs, device, k=3.0, lr=1e-
             rec_loss = freq_criterion(output, input_data)
             loss1 = rec_loss - k * series_loss
             loss2 = rec_loss + k * prior_loss
+
+            # Add FedProx proximal term
+            proximal_term = 0.0
+            # Note: Adjust index slicing for freq_model params
+            freq_params_start_index = len(list(time_model.parameters()))
+            for local_param, global_param in zip(freq_model.parameters(), global_params[freq_params_start_index:]):
+                proximal_term += (local_param - global_param).pow(2).sum()
+
+            loss1 += (proximal_mu / 2) * proximal_term
+            loss2 += (proximal_mu / 2) * proximal_term
+
             loss1.backward(retain_graph=True)
             loss2.backward()
             freq_optimizer.step()

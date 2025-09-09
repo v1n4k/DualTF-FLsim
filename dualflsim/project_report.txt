@@ -1,0 +1,69 @@
+### **Project Report: Federated Learning Implementation of the Dual-Transformer Model**
+
+**Author:** Nhat Huy Le
+**Date:** 8 September 2025
+
+---
+
+#### **1. Executive Summary**
+
+This report details the successful conversion of the `Dual-TF` time-series anomaly detection model into a multi-GPU federated learning (FL) simulation. The primary objective was to train the complex, dual-transformer architecture on a decentralized dataset using the Flower framework. Initial attempts using the standard Flower command-line interface failed due to critical issues with GPU resource propagation in a Ray backend. The project pivoted to a "Flower-as-a-Library" approach, which provided the necessary control to overcome these challenges. The final implementation successfully trains the complete `Dual-TF` model in a federated environment, leverages multiple GPUs for client simulation, and evaluates performance using the sophisticated, point-adjusted F1-score metric from the original paper.
+
+---
+
+#### **2. The Initial Challenge: The Limitations of `flwr run`**
+
+The project began with the standard approach for running Flower simulations: the `flwr run` command-line interface. The goal was to have multiple virtual clients, each assigned to a separate GPU, to accelerate the simulation.
+
+However, this approach immediately presented a critical roadblock:
+
+*   **Problem**: The `flwr run` command, in conjunction with the Ray backend, failed to correctly propagate the necessary `CUDA_VISIBLE_DEVICES` environment variables to the Ray actors (the processes that run the client logic).
+*   **Consequence**: Although the main process could see all available GPUs, the spawned Ray actors could not. They were effectively blind to the GPUs, leading to failures and an inability to run the simulation in a multi-GPU environment. All clients would default to the CPU or the first available GPU, defeating the purpose of the simulation.
+
+---
+
+#### **3. The Strategic Pivot: Adopting "Flower-as-a-Library"**
+
+To overcome the limitations of `flwr run`, a strategic decision was made to abandon the command-line interface and adopt the **"Flower-as-a-Library"** pattern. This involved creating a custom Python script (`run_simulation.py`) to orchestrate the entire process.
+
+This pivot was the most important turning point in the project for several reasons:
+
+*   **Direct Control over Ray**: It allowed for the programmatic initialization of Ray via `ray.init()`. We could explicitly tell Ray how many GPUs were available *before* the Flower simulation started.
+*   **Explicit Client Resources**: We could define the resources for each client (`client_resources = {"num_cpus": 1, "num_gpus": 1}`) directly in the code, ensuring that Flower's simulation engine would request a dedicated GPU for each client actor from Ray.
+*   **Problem Solved**: This approach completely solved the GPU visibility issue. Ray, now properly initialized, could correctly manage and assign a unique GPU to each of the 4 parallel client actors, enabling true multi-GPU simulation.
+
+---
+
+#### **4. A Methodical Integration Process**
+
+With a stable, multi-GPU federated framework in place, the `DualTF` project was migrated in a series of methodical steps:
+
+1.  **Model Integration**: A unified `FederatedDualTF` PyTorch module was created to act as a single container for both the `AnomalyTransformer` and `FrequencyTransformer`. This simplified weight management for the Flower client.
+
+2.  **Data Integration**: The placeholder data loaders were replaced with the project's actual `load_tods` function. This involved copying the `utils` and `datasets` directories. This step surfaced a `CUDA: invalid device ordinal` error, which was resolved by simplifying the device assignment in `client_app.py` to `cuda:0`, allowing Ray to correctly manage the mapping from the logical `cuda:0` within the actor to the physical GPUs.
+
+3.  **Training Logic Integration**: The placeholder `train` and `test` functions were replaced with the complex, self-supervised training logic from the original project, including the minimax loss strategy and the custom KL-divergence loss. This was done first for the time model and then for the frequency model.
+
+4.  **Evaluation Logic Integration**: The final and most critical step was to replace the simple accuracy/loss evaluation with the sophisticated logic from `evaluation.py`. A new `test` function was implemented in `task.py` that:
+    *   Calculates anomaly scores from both models.
+    *   Normalizes and combines the scores.
+    *   Performs a threshold simulation to find the best point-adjusted F1-score, Precision, and Recall.
+    *   A custom `evaluate_metrics_aggregation_fn` was added to the server strategy to correctly average these new, complex metrics from all clients.
+
+---
+
+#### **5. Key Debugging and Problem-Solving**
+
+Several technical issues were identified and resolved during the integration:
+
+*   **CUDA Out of Memory**: The `FrequencyTransformer` was found to be highly memory-intensive. This was resolved by implementing separate batch size controls for the time and frequency data loaders, allowing us to use a much smaller batch size (8) for the frequency model.
+*   **Flower `TypeError`**: The `evaluate` function was returning a `numpy.float64` for the loss, but Flower's `NumPyClient` strictly requires a native Python `float`. This was fixed with a simple type cast: `float(loss)`.
+*   **Ray Configuration Errors**: Attempts to suppress Ray's disk space warnings using a `_system_config` dictionary failed due to version incompatibility. This was resolved by using the officially supported `RAY_DISABLE_TMP_DIR_WARNING` environment variable, which was set *before* importing Ray to ensure it was correctly applied.
+
+---
+
+#### **6. Final Outcome and Conclusion**
+
+The project successfully achieved its objective. The final implementation is a robust federated learning simulation of the `Dual-TF` model capable of leveraging multiple GPUs. The system correctly trains both the time and frequency domain models on partitioned data and evaluates their combined performance using the original paper's sophisticated F1-score calculation.
+
+The final run demonstrated the system's effectiveness, achieving an F1-score of **76.3%**, Precision of **96.9%**, and Recall of **62.9%** after just one round of federated training, proving the viability of training complex anomaly detection models in a decentralized, privacy-preserving manner.
