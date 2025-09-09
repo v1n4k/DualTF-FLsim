@@ -52,8 +52,8 @@ def main():
 
     # Define strategy
     strategy = FedProx(
-        fraction_fit=0.15,  # Train on 15% of clients per round
-        fraction_evaluate=0.2, # Evaluate on 20% of clients
+        fraction_fit=0.25,  # Train on 25% of clients per round
+        fraction_evaluate=1, # Evaluate on 100% of clients
         min_available_clients=55,
         initial_parameters=parameters,
         on_fit_config_fn=fit_config,
