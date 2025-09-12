@@ -7,6 +7,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from sklearn.metrics import precision_recall_fscore_support
 from sklearn.preprocessing import MinMaxScaler
+from torch.cuda.amp import autocast, GradScaler
 
 # Import the model definitions from the copied directory
 from model.TimeTransformer import AnomalyTransformer
@@ -21,7 +22,7 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 # Import the data loading and processing logic from the copied utils
-from utils.data_loader import load_tods, TrainingLoader, GeneralLoader, generate_frequency_grandwindow, _create_sequences
+from utils.data_loader import load_tods, TrainingLoader, GeneralLoader, generate_frequency_grandwindow, _create_sequences, load_PSM
 
 
 class FederatedDualTF(nn.Module):
@@ -32,25 +33,36 @@ class FederatedDualTF(nn.Module):
         self.freq_model = FrequencyTransformer(**freq_model_args)
 
 
-def load_data(partition_id: int, num_partitions: int, time_batch_size: int = 64, freq_batch_size: int = 8, seq_length: int = 100):
+def load_data(
+    partition_id: int,
+    num_partitions: int,
+    time_batch_size: int = 64,
+    freq_batch_size: int = 8,
+    seq_length: int = 100,
+    dirichlet_alpha: float = 2.0,
+):
     """Load and partition the time-series data."""
     # Load the full dataset using the function from the original project
-    # We'll use 'seasonal' form from 'NeurIPSTS' as a starting point.
     # The data_loader expects a './datasets' folder in the CWD.
     # The run_simulation.py script is in the parent directory, so this path should resolve correctly.
-    data_dict = load_tods(form='seasonal', seq_length=seq_length, stride=1)
-    x_train_full, x_test, y_test = data_dict['x_train'], data_dict['x_test'], data_dict['y_test']
+    data_dict = load_PSM(seq_length=seq_length, stride=1)
+    # PSM loader returns lists, we take the first element
+    x_train_full, x_test, y_test = data_dict['x_train'][0], data_dict['x_test'][0], data_dict['y_test'][0]
+
+    # Standardization: z-score per feature before training
+    mean = np.mean(x_train_full, axis=0)
+    std = np.std(x_train_full, axis=0) + 1e-6  # Avoid division by zero
+    x_train_full = (x_train_full - mean) / std
+    x_test = (x_test - mean) / std
 
     # --- Federated Partitioning (Time Domain) ---
-    num_samples = len(x_train_full)
-    samples_per_partition = num_samples // num_partitions
-    start_idx = partition_id * samples_per_partition
-    end_idx = start_idx + samples_per_partition
-    if partition_id == num_partitions - 1:
-        end_idx = num_samples
-    x_train_partition = x_train_full[start_idx:end_idx]
+    # Partition the training data using a quantity-based Dirichlet distribution
+    train_partitions = partition_data_dirichlet_quantity(
+        x_train_full, num_partitions, alpha=dirichlet_alpha
+    )
+    x_train_partition = train_partitions[partition_id]
     
-    print(f"Client {partition_id}: Loading {len(x_train_partition)} time-domain training samples from index {start_idx} to {end_idx}.")
+    print(f"Client {partition_id}: Loading {len(x_train_partition)} time-domain training samples.")
 
     # Create Time-Domain DataLoaders
     train_dataset_time = TrainingLoader(x_train_partition)
@@ -83,51 +95,117 @@ def my_kl_loss(p, q):
     return torch.mean(torch.sum(res, dim=-1), dim=1)
 
 
-def train(net, trainloader_time, trainloader_freq, epochs, device, proximal_mu, k=3.0, lr=1e-4):
-    """Train the complete DualTF model with FedProx."""
+def train(net, trainloader_time, trainloader_freq, epochs, device, proximal_mu, k=3.0, lr=1e-5, control_c=None, control_ci=None):
+    """Train the complete DualTF model.
+
+    If control_c and control_ci are provided (SCAFFOLD), apply gradient
+    correction g <- g - ci + c before each optimizer step. Set proximal_mu=0
+    to disable FedProx when using SCAFFOLD.
+    Returns: (train_loss_placeholder, total_optimizer_steps)
+    """
     
-    # Store initial weights for FedProx
-    global_params = [param.clone() for param in net.parameters()]
+    # Note: Clone initial weights per-submodel on the target device for FedProx
+
+    # Enable mixed precision to reduce memory
+    use_amp = device.type == "cuda"
+    scaler = GradScaler(enabled=use_amp)
+
+    # Prepare control variates if provided
+    if control_c is not None and control_ci is not None:
+        c_tensors_all = [torch.tensor(a, device=device, dtype=torch.float32) for a in control_c]
+        ci_tensors_all = [torch.tensor(a, device=device, dtype=torch.float32) for a in control_ci]
+    else:
+        c_tensors_all = None
+        ci_tensors_all = None
+
+    total_steps = 0
 
     # --- Train Time Model ---
     time_model = net.time_model
     time_model.to(device)
+    # Clone global params for time model on the same device as local params
+    global_params_time = [p.detach().clone().to(device) for p in time_model.parameters()]
     time_model.train()
     time_optimizer = torch.optim.Adam(time_model.parameters(), lr=lr)
     time_criterion = nn.MSELoss()
     
     print("Training Time-Domain Model...")
+    params_time = list(time_model.parameters())
+    n_time = len(params_time)
+    if c_tensors_all is not None:
+        c_time = c_tensors_all[:n_time]
+        ci_time = ci_tensors_all[:n_time]
+    else:
+        c_time = ci_time = None
     for epoch in range(epochs):
         for input_data in trainloader_time:
             input_data = input_data.float().to(device)
-            time_optimizer.zero_grad()
-            output, series, prior, _ = time_model(input_data)
-            series_loss = 0.0
-            prior_loss = 0.0
-            for u in range(len(prior)):
-                series_loss += (torch.mean(my_kl_loss(series[u], (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1, time_model.win_size)).detach())) + torch.mean(my_kl_loss((prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1, time_model.win_size)).detach(), series[u])))
-                prior_loss += (torch.mean(my_kl_loss((prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1, time_model.win_size)),series[u].detach())) + torch.mean(my_kl_loss(series[u].detach(), (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1, time_model.win_size)))))
-            series_loss /= len(prior)
-            prior_loss /= len(prior)
-            rec_loss = time_criterion(output, input_data)
-            loss1 = rec_loss - k * series_loss
-            loss2 = rec_loss + k * prior_loss
+            time_optimizer.zero_grad(set_to_none=True)
+            with autocast(enabled=use_amp):
+                output, series, prior, _ = time_model(input_data)
+                series_loss = 0.0
+                prior_loss = 0.0
+                for u in range(len(prior)):
+                    # Stable normalization with epsilon to avoid NaNs/Infs
+                    den = torch.sum(prior[u], dim=-1, keepdim=True) + 1e-12
+                    prior_norm = prior[u] / den  # [B, H, L, L]
+                    series_loss += (
+                        torch.mean(
+                            my_kl_loss(
+                                series[u],
+                                prior_norm.detach(),
+                            )
+                        )
+                        + torch.mean(
+                            my_kl_loss(
+                                prior_norm.detach(),
+                                series[u],
+                            )
+                        )
+                    )
+                    prior_loss += (
+                        torch.mean(
+                            my_kl_loss(
+                                prior_norm,
+                                series[u].detach(),
+                            )
+                        )
+                        + torch.mean(
+                            my_kl_loss(
+                                series[u].detach(),
+                                prior_norm,
+                            )
+                        )
+                    )
+                series_loss /= len(prior)
+                prior_loss /= len(prior)
+                rec_loss = time_criterion(output, input_data)
+                loss1 = rec_loss - k * series_loss
+                loss2 = rec_loss + k * prior_loss
 
-            # Add FedProx proximal term
-            proximal_term = 0.0
-            for local_param, global_param in zip(time_model.parameters(), global_params[:len(list(time_model.parameters()))]):
-                proximal_term += (local_param - global_param).pow(2).sum()
-            
-            loss1 += (proximal_mu / 2) * proximal_term
-            loss2 += (proximal_mu / 2) * proximal_term
+                # Add FedProx proximal term
+                proximal_term = 0.0
+                for local_param, global_param in zip(time_model.parameters(), global_params_time):
+                    proximal_term += (local_param - global_param).pow(2).sum()
 
-            loss1.backward(retain_graph=True)
-            loss2.backward()
+                total_loss = loss1 + loss2 + (proximal_mu / 2) * proximal_term
+
+            scaler.scale(total_loss).backward()
+            # Apply SCAFFOLD correction if provided
+            scaler.unscale_(time_optimizer)
+            if c_time is not None and ci_time is not None:
+                for p, c_k, ci_k in zip(params_time, c_time, ci_time):
+                    if p.grad is not None:
+                        p.grad.add_(c_k - ci_k)
             time_optimizer.step()
+            scaler.update()
+            total_steps += 1
 
     # --- Train Frequency Model ---
     freq_model = net.freq_model
     freq_model.to(device)
+    # Clone global params for freq model on the same device as local params
+    global_params_freq = [p.detach().clone().to(device) for p in freq_model.parameters()]
     freq_model.train()
     freq_optimizer = torch.optim.Adam(freq_model.parameters(), lr=lr)
     freq_criterion = nn.MSELoss()
@@ -136,38 +214,75 @@ def train(net, trainloader_time, trainloader_freq, epochs, device, proximal_mu, 
     for epoch in range(epochs):
         for input_data in trainloader_freq:
             input_data = input_data.float().to(device)
-            freq_optimizer.zero_grad()
-            output, series, prior, _ = freq_model(input_data)
-            series_loss = 0.0
-            prior_loss = 0.0
-            # Assuming win_size is also an attribute here. We will need to add it.
-            win_size = freq_model.win_size 
-            for u in range(len(prior)):
-                series_loss += (torch.mean(my_kl_loss(series[u], (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1, win_size)).detach())) + torch.mean(my_kl_loss((prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1, win_size)).detach(), series[u])))
-                prior_loss += (torch.mean(my_kl_loss((prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1, win_size)),series[u].detach())) + torch.mean(my_kl_loss(series[u].detach(), (prior[u] / torch.unsqueeze(torch.sum(prior[u], dim=-1), dim=-1).repeat(1, 1, 1, win_size)))))
-            series_loss /= len(prior)
-            prior_loss /= len(prior)
-            rec_loss = freq_criterion(output, input_data)
-            loss1 = rec_loss - k * series_loss
-            loss2 = rec_loss + k * prior_loss
+            freq_optimizer.zero_grad(set_to_none=True)
+            with autocast(enabled=use_amp):
+                output, series, prior, _ = freq_model(input_data)
+                series_loss = 0.0
+                prior_loss = 0.0
+                for u in range(len(prior)):
+                    den = torch.sum(prior[u], dim=-1, keepdim=True) + 1e-12
+                    prior_norm = prior[u] / den
+                    series_loss += (
+                        torch.mean(
+                            my_kl_loss(
+                                series[u],
+                                prior_norm.detach(),
+                            )
+                        )
+                        + torch.mean(
+                            my_kl_loss(
+                                prior_norm.detach(),
+                                series[u],
+                            )
+                        )
+                    )
+                    prior_loss += (
+                        torch.mean(
+                            my_kl_loss(
+                                prior_norm,
+                                series[u].detach(),
+                            )
+                        )
+                        + torch.mean(
+                            my_kl_loss(
+                                series[u].detach(),
+                                prior_norm,
+                            )
+                        )
+                    )
+                series_loss /= len(prior)
+                prior_loss /= len(prior)
+                rec_loss = freq_criterion(output, input_data)
+                loss1 = rec_loss - k * series_loss
+                loss2 = rec_loss + k * prior_loss
 
-            # Add FedProx proximal term
-            proximal_term = 0.0
-            # Note: Adjust index slicing for freq_model params
-            freq_params_start_index = len(list(time_model.parameters()))
-            for local_param, global_param in zip(freq_model.parameters(), global_params[freq_params_start_index:]):
-                proximal_term += (local_param - global_param).pow(2).sum()
+                # Add FedProx proximal term
+                proximal_term = 0.0
+                for local_param, global_param in zip(freq_model.parameters(), global_params_freq):
+                    proximal_term += (local_param - global_param).pow(2).sum()
 
-            loss1 += (proximal_mu / 2) * proximal_term
-            loss2 += (proximal_mu / 2) * proximal_term
+                total_loss = loss1 + loss2 + (proximal_mu / 2) * proximal_term
 
-            loss1.backward(retain_graph=True)
-            loss2.backward()
+            scaler.scale(total_loss).backward()
+            # Apply SCAFFOLD correction if provided
+            scaler.unscale_(freq_optimizer)
+            params_freq = list(freq_model.parameters())
+            if c_tensors_all is not None:
+                c_freq = c_tensors_all[n_time:]
+                ci_freq = ci_tensors_all[n_time:]
+            else:
+                c_freq = ci_freq = None
+            if c_freq is not None and ci_freq is not None:
+                for p, c_k, ci_k in zip(params_freq, c_freq, ci_freq):
+                    if p.grad is not None:
+                        p.grad.add_(c_k - ci_k)
             freq_optimizer.step()
+            scaler.update()
+            total_steps += 1
 
     # For simplicity, we'll just return 0.0 as a placeholder loss for now.
     # A more sophisticated approach would be to combine losses.
-    return 0.0
+    return 0.0, total_steps
 
 
 def get_anomaly_scores(net, dataloader, device, is_time_model=True):
@@ -181,10 +296,12 @@ def get_anomaly_scores(net, dataloader, device, is_time_model=True):
     scores = []
     labels = []
     
+    use_amp = device.type == 'cuda'
     with torch.no_grad():
         for input_data, target in dataloader:
             input_data = input_data.float().to(device)
-            output, series, prior, _ = model(input_data)
+            with autocast(enabled=use_amp):
+                output, series, prior, _ = model(input_data)
             
             # Reconstruction loss for each sample in the batch
             rec_loss = criterion(output, input_data).mean(dim=(1, 2))
@@ -208,7 +325,7 @@ def get_anomaly_scores(net, dataloader, device, is_time_model=True):
     return np.concatenate(scores), np.concatenate(labels)
 
 
-def get_best_f1(scores, labels, seq_length=100, step=1, num_thresholds=1000):
+def get_best_f1(scores, labels, seq_length=100, step=5, num_thresholds=201):
     """Find the best F1 score by simulating thresholds."""
     
     # Create sequences for point-adjusted evaluation
@@ -255,6 +372,24 @@ def test(net, testloader_time, testloader_freq, device):
     time_scores, time_labels = get_anomaly_scores(net, testloader_time, device, is_time_model=True)
     freq_scores, _ = get_anomaly_scores(net, testloader_freq, device, is_time_model=False)
 
+    # Diagnostics: check for NaN/Inf and value ranges before scaling
+    def _print_stats(name, arr):
+        total = arr.size
+        nan = int(np.isnan(arr).sum())
+        inf = int(np.isinf(arr).sum())
+        finite_mask = np.isfinite(arr)
+        finite_cnt = int(finite_mask.sum())
+        if finite_cnt > 0:
+            fin_min = float(np.min(arr[finite_mask]))
+            fin_max = float(np.max(arr[finite_mask]))
+        else:
+            fin_min = np.nan
+            fin_max = np.nan
+        print(f"[Eval] {name}: size={total}, nan={nan}, inf={inf}, finite={finite_cnt}, min={fin_min}, max={fin_max}")
+
+    _print_stats("time_scores", time_scores)
+    _print_stats("freq_scores", freq_scores)
+
     # The frequency domain data is shorter due to windowing. We need to align them.
     # The original paper's evaluation logic loads pre-computed, aligned scores.
     # Here, we'll pad the shorter frequency scores to match the time scores length.
@@ -262,7 +397,9 @@ def test(net, testloader_time, testloader_freq, device):
         padding = len(time_scores) - len(freq_scores)
         freq_scores = np.pad(freq_scores, (0, padding), 'edge')
 
-    # 2. Normalize and combine scores
+    # 2. Normalize and combine scores (sanitize to avoid NaN/Inf)
+    time_scores = np.nan_to_num(time_scores, nan=0.0, posinf=0.0, neginf=0.0)
+    freq_scores = np.nan_to_num(freq_scores, nan=0.0, posinf=0.0, neginf=0.0)
     scaler = MinMaxScaler()
     time_scores_norm = scaler.fit_transform(time_scores.reshape(-1, 1)).flatten()
     freq_scores_norm = scaler.fit_transform(freq_scores.reshape(-1, 1)).flatten()
@@ -278,6 +415,36 @@ def test(net, testloader_time, testloader_freq, device):
     print(f"Test Results - F1: {f1:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}")
 
     return loss, {"f1": f1, "precision": precision, "recall": recall}
+
+
+def partition_data_dirichlet_quantity(data, num_partitions, alpha=0.5, seed=42):
+    """Partitions data into different quantities based on a Dirichlet distribution."""
+    np.random.seed(seed)  # Ensure deterministic partitioning across clients
+    num_samples = len(data)
+
+    # Get proportions for data quantity
+    proportions = np.random.dirichlet(np.repeat(alpha, num_partitions))
+
+    # Calculate the number of samples for each partition
+    samples_per_partition = np.round(proportions * num_samples).astype(int)
+
+    # Ensure the sum is correct due to rounding
+    samples_per_partition[-1] = num_samples - np.sum(samples_per_partition[:-1])
+
+    # Shuffle data indices
+    indices = np.arange(num_samples)
+    np.random.shuffle(indices)
+
+    # Create the partitions
+    partitions = []
+    start = 0
+    for num_samples_in_partition in samples_per_partition:
+        end = start + num_samples_in_partition
+        partition_indices = indices[start:end]
+        partitions.append(data[partition_indices])
+        start = end
+
+    return partitions
 
 
 def get_weights(net):
