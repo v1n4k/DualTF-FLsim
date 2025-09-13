@@ -72,6 +72,7 @@ class FlowerClient(NumPyClient):
             self.device,
             proximal_mu,
             lr=lr,
+            k=5.0,
             control_c=control_c,
             control_ci=control_ci,
         )
@@ -110,22 +111,9 @@ class FlowerClient(NumPyClient):
         return get_weights(self.net), num_examples, metrics
 
     def evaluate(self, parameters, config):
-        set_weights(self.net, parameters)
-        # Pass both testing dataloaders to the test function
-        loss, metrics = test(self.net, self.valloader_time, self.valloader_freq, self.device)
-        # Cleanup after evaluation on client (precaution; server uses server-side eval)
-        try:
-            self.net.to("cpu")
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
-        except Exception:
-            pass
-        gc.collect()
-        # Return the total number of testing samples
-        num_examples = len(self.valloader_time.dataset) + len(self.valloader_freq.dataset)
-        # Ensure the loss is a standard Python float
-        return float(loss), num_examples, metrics
+        # Client-side evaluation disabled: avoid any thresholding or heavy work.
+        # Keep a placeholder shape for compatibility if ever invoked by strategy.
+        return 0.0, 0, {"client_eval": "disabled"}
 
 
 def client_fn(context: Context):
@@ -135,6 +123,7 @@ def client_fn(context: Context):
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
     os.environ.setdefault("NUMEXPR_NUM_THREADS", "2")
     # CUDA allocator tuning (avoid expandable_segments due to allocator assert on some setups)
+    # Avoid expandable_segments due to allocator asserts on some PyTorch builds
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:256,garbage_collection_threshold:0.8")
     try:
         torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "2")))
@@ -143,12 +132,15 @@ def client_fn(context: Context):
     # Load model and data
     # Define model configurations based on the original project's defaults
     # For PSM dataset, the number of features (channels) is 25
-    time_model_args = {'win_size': 100, 'enc_in': 25, 'c_out': 25, 'e_layers': 3}
+    # Set sequence length and nest length as requested
+    seq_len = 100
+    time_model_args = {'win_size': seq_len, 'enc_in': 25, 'c_out': 25, 'e_layers': 3}
     # The input to the frequency model depends on the `nest_length` used in data generation
     nest_length = 25
-    freq_win_size = (100 - nest_length + 1) * (nest_length // 2)
+    freq_win_size = (seq_len - nest_length + 1) * (nest_length // 2)
     # Frequency grand-window keeps the feature dimension (25) as channels
-    freq_model_args = {'win_size': freq_win_size, 'enc_in': 25, 'c_out': 25, 'e_layers': 3}
+    # Reduce heads to cut attention memory in freq model
+    freq_model_args = {'win_size': freq_win_size, 'enc_in': 25, 'c_out': 25, 'e_layers': 3, 'n_heads': 4}
     net = FederatedDualTF(time_model_args, freq_model_args)
     
     partition_id = int(context.node_config["partition-id"])
@@ -158,9 +150,10 @@ def client_fn(context: Context):
     trainloader_time, valloader_time, trainloader_freq, valloader_freq = load_data(
         partition_id=partition_id, 
         num_partitions=num_partitions,
-        time_batch_size=64,   # Safer peak VRAM for time model
-        freq_batch_size=4,    # Safer peak VRAM for freq model
+        time_batch_size=64,
+        freq_batch_size=16,
         dirichlet_alpha=2.0,  # Moderately balanced quantity split for PSM
+        seq_length=seq_len,
     )
 
     # Return Client instance with all dataloaders

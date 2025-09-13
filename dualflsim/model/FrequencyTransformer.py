@@ -99,11 +99,24 @@ class FrequencyAttention(nn.Module):
         window_size = attn.shape[-1]
         sigma = torch.sigmoid(sigma * 5) + 1e-5
         sigma = torch.pow(3, sigma) - 1
+        # Clamp sigma to a safe range to avoid extreme Gaussian prior values
+        sigma = torch.clamp(sigma, min=1e-4, max=1e2)
         sigma = sigma.unsqueeze(-1).repeat(1, 1, 1, window_size)  # B H L L
-        prior = self.distances.unsqueeze(0).unsqueeze(0).repeat(sigma.shape[0], sigma.shape[1], 1, 1)
+        # Adjust or regenerate the distance matrix to match the actual window size (L)
+        # This prevents shape mismatches when effective sequence length differs
+        # from the constructor's win_size due to stride/step changes in data prep.
+        if self.distances.shape[0] >= window_size:
+            dists = self.distances[:window_size, :window_size]
+        else:
+            idx = torch.arange(window_size, device=self.distances.device)
+            dists = (idx[None, :] - idx[:, None]).abs().float()
+        prior = dists.unsqueeze(0).unsqueeze(0).repeat(sigma.shape[0], sigma.shape[1], 1, 1)
         prior = 1.0 / (math.sqrt(2 * math.pi) * sigma) * torch.exp(-prior ** 2 / 2 / (sigma ** 2))
 
         series = self.dropout(torch.softmax(attn, dim=-1))
+        # Repair any potential numerical issues (NaN/Inf rows) and re-normalize
+        series = torch.nan_to_num(series, nan=0.0, posinf=0.0, neginf=0.0)
+        series = series / (series.sum(dim=-1, keepdim=True) + 1e-12)
         V = torch.einsum("bhls,bshd->blhd", series, values)
 
         if self.output_attention:

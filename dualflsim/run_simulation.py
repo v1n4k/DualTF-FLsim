@@ -17,6 +17,7 @@ from dualflsim.task import (
     get_weights,
     set_weights,
     load_data,
+    load_centralized_test_data,
     test,
 )
 import numpy as np
@@ -31,7 +32,7 @@ def fit_config(server_round: int) -> Dict[str, fl.common.Scalar]:
         # FedProx disabled for SCAFFOLD (kept for compatibility)
         "proximal_mu": 0.0,
         # Client learning rate for both time/freq optimizers
-        "lr": 3e-5,
+    "lr": 1e-4,
     }
     return config
 
@@ -96,27 +97,30 @@ class SaveResultsStrategy(FedProx):
 
 
 def main():
-    # 1. Initialize Ray explicitly and tell it about available GPUs
-    # Disable the disk space warning by setting an environment variable
-    # Reserve 1 GPU for server-side evaluation by exposing only 3 to Ray
-    ray.init(num_cpus=32, num_gpus=3)
+    # 1. Optionally initialize Ray. We'll also pass ray_init_args to Flower
+    # so that it respects the same GPU reservation (3 GPUs for clients,
+    # leaving 1 GPU free for server-side evaluation).
+    ray.init(num_cpus=32, num_gpus=3, ignore_reinit_error=True)
     print("Ray initialized.")
     print(f"Ray resources: {ray.available_resources()}")
 
-    # 2. Define the client resources directly in code.
-    client_resources = {"num_cpus": 2, "num_gpus": 1}
+    # 2. Define the client resources to 4cpus + 1gpu
+    # Use 3 GPUs for clients; 1 GPU will be reserved for server eval
+    client_resources = {"num_cpus": 4, "num_gpus": 1}
 
     # 3. Define the strategy
     # Define model configurations based on the original project's defaults
     # For PSM dataset, the number of features (channels) is 25
-    time_model_args = {'win_size': 100, 'enc_in': 25, 'c_out': 25, 'e_layers': 3}
+    seq_len = 100
+    time_model_args = {'win_size': seq_len, 'enc_in': 25, 'c_out': 25, 'e_layers': 3}
     # Frequency grand-window keeps the feature dimension (25) as channels
     # Sequence length becomes (seq_len - nest_len + 1) * floor(nest_len/2)
     freq_model_args = {
-        'win_size': (100 - 25 + 1) * (25 // 2),
+        'win_size': (seq_len - 25 + 1) * (25 // 2),
         'enc_in': 25,
         'c_out': 25,
         'e_layers': 3,
+        'n_heads': 4,  # Align with clients to avoid shape mismatch and reduce memory
     }
 
     # Initialize model parameters
@@ -125,6 +129,15 @@ def main():
     parameters = ndarrays_to_parameters(ndarrays)
     # Parameter-only templates for SCAFFOLD control variates (exclude buffers)
     param_templates = [p.detach().cpu().numpy() for p in temp_model.parameters()]
+
+    # Preload centralized test dataloaders once to avoid rebuilding/grandwindow every round
+    print("[Server] Preloading centralized test dataloaders...")
+    testloader_time_global, testloader_freq_global = load_centralized_test_data(
+        time_batch_size=128,
+        freq_batch_size=8,
+        seq_length=seq_len,
+    )
+    print(f"[Server] Test sizes: time={len(testloader_time_global.dataset)}, freq={len(testloader_freq_global.dataset)}")
 
     # ---------- SCAFFOLD helpers ----------
     def pack_ndarrays_to_bytes(arrs: List[np.ndarray]) -> bytes:
@@ -223,14 +236,17 @@ def main():
             return aggregated_parameters, aggregated_metrics
 
     # Server-side evaluation to centralize threshold sweep
+    eval_state: Dict[str, float] = {}
+    total_rounds: int = 30
+
     def server_evaluate_fn(
         server_round: int,
         params: List,  # already a list of ndarrays provided by Flower
         config: Dict[str, fl.common.Scalar],
     ) -> Tuple[float, Dict[str, fl.common.Scalar]]:
-        # Optionally skip round 0 evaluation to avoid logging the untrained baseline
-        if server_round == 0:
-            print("[Server] Skipping evaluation for round 0")
+        # Evaluate every 3 rounds and on the final round
+        if (server_round % 3 != 0) and (server_round != total_rounds):
+            print(f"[Server] Skipping evaluation for round {server_round} (evaluate every 3 rounds & final round)")
             return None
         import os
         # Give the server more CPU threads for evaluation
@@ -244,15 +260,20 @@ def main():
             pass
 
         # Prefer a GPU with enough free memory; fall back to CPU if none
+        # Avoid expandable_segments due to allocator asserts on some PyTorch builds
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:256,garbage_collection_threshold:0.8")
         # Use the highest-index GPU (kept free by Ray) for server evaluation
         if torch.cuda.is_available() and torch.cuda.device_count() >= 1:
             device_index = torch.cuda.device_count() - 1
+            try:
+                torch.cuda.set_device(device_index)
+            except Exception:
+                pass
             device = torch.device(f"cuda:{device_index}")
         else:
             device = torch.device("cpu")
-
         print(f"[Server] Evaluating round {server_round} on central test set (device={device})...")
+        print(f"[Server DEBUG] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES','<unset>')}, cuda_count={torch.cuda.device_count()}")
         # Rebuild model and load parameters
         net = FederatedDualTF(time_model_args, freq_model_args)
         # params is already a list of ndarrays; set directly
@@ -262,16 +283,32 @@ def main():
             return None
         set_weights(net, params)
 
-        # Load full test loaders on the server and evaluate sequentially on the reserved GPU
-        _, testloader_time, _, testloader_freq = load_data(
-            partition_id=0,
-            num_partitions=1,
-            time_batch_size=64,
-            freq_batch_size=32,
-            dirichlet_alpha=2.0,
-        )
+        # Use preloaded test loaders
+        testloader_time, testloader_freq = testloader_time_global, testloader_freq_global
+        print(f"[Server DEBUG] testloader_time length: {len(testloader_time.dataset)}")
+        print(f"[Server DEBUG] testloader_freq length: {len(testloader_freq.dataset)}")
+        assert len(testloader_time.dataset) > 0, "Time dataloader is empty!"
+        assert len(testloader_freq.dataset) > 0, "Freq dataloader is empty!"
+
         # Evaluate using existing test() which handles both models and threshold sweep
-        loss, metrics = test(net, testloader_time, testloader_freq, device)
+        # Use fast settings for periodic rounds; thorough on final round
+        is_final = (server_round == total_rounds)
+        thr_cnt = 1000 if is_final else 256
+        step_val = 1 if is_final else 5
+
+        loss, metrics = test(
+            net,
+            testloader_time,
+            testloader_freq,
+            device,
+            eval_state=eval_state,
+            min_consecutive=10,
+            num_thresholds=thr_cnt,
+            seq_length=50,
+            step=step_val,
+            threshold_quantile_range=(0.01, 0.99),
+            prefer_gpu_sweep=True,
+        )
         # Cleanup: free VRAM on the reserved eval GPU
         try:
             del net
@@ -286,14 +323,15 @@ def main():
 
     # Define strategy (standard partial participation): only selected clients get the global
     strategy = ScaffoldStrategy(
-        fraction_fit=0.25,   # ~6 clients train per round
+        fraction_fit=0.25,   # we'll rely on min_fit_clients to select exactly 1
         fraction_evaluate=0.0,  # Use server-side evaluation only
-        min_available_clients=24,
-        min_fit_clients=6,
+        min_available_clients=6, # at least 6 clients must be connected to proceed
+        min_fit_clients=6, # at least 6 clients to ensure diversity
         initial_parameters=parameters,
         on_fit_config_fn=fit_config,
         evaluate_metrics_aggregation_fn=aggregate_metrics,
-        proximal_mu=0.1,
+        # Disable FedProx term when running SCAFFOLD; keep 0.0 for clarity
+        proximal_mu=0.0,
         evaluate_fn=server_evaluate_fn,
     )
 
@@ -303,7 +341,13 @@ def main():
         client_fn=client_fn,
         num_clients=24,
         client_resources=client_resources,
-        config=ServerConfig(num_rounds=30), # More rounds to see convergence
+        config=ServerConfig(num_rounds=total_rounds), # More rounds to see convergence
+        # Force Flower to initialize Ray with only 3 GPUs to reserve 1 GPU for server eval
+        ray_init_args={
+            "num_cpus": 32,
+            "num_gpus": 3,
+            "ignore_reinit_error": True,
+        },
         strategy=strategy,
     )
 

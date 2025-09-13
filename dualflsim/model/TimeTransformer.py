@@ -103,6 +103,9 @@ class AnomalyAttention(nn.Module):
         prior = 1.0 / (math.sqrt(2 * math.pi) * sigma) * torch.exp(-prior ** 2 / 2 / (sigma ** 2))
 
         series = self.dropout(torch.softmax(attn, dim=-1))
+        # Repair any potential numerical issues (NaN/Inf rows) and re-normalize
+        series = torch.nan_to_num(series, nan=0.0, posinf=0.0, neginf=0.0)
+        series = series / (series.sum(dim=-1, keepdim=True) + 1e-12)
         V = torch.einsum("bhls,bshd->blhd", series, values)
 
         if self.output_attention:

@@ -119,13 +119,21 @@ def generate_frequency_grandwindow(x_trains, x_tests, y_tests, nest_length, step
     grand_trains, grand_tests, grand_labels = [], [], []
     # sub_evaluation_arrays = []
     # x_trains: (301, 100, 1)
-    for grand in range(len(x_trains)):
-        sub_x_trains = _create_sequences(x_trains[grand], nest_length, step)
-        train_sequences, freq = torch_fft_transform(sub_x_trains)
-        grand_trains.append(train_sequences) 
-    grand_train = np.array(grand_trains) # (grand_train: (301, 76, 25/2, 1) )
-    grand_train_reshaped = grand_train.reshape(grand_train.shape[0], grand_train.shape[1]*grand_train.shape[2], grand_train.shape[3])
-    
+    if x_trains.size > 0:
+        for grand in range(len(x_trains)):
+            sub_x_trains = _create_sequences(x_trains[grand], nest_length, step)
+            train_sequences, freq = torch_fft_transform(sub_x_trains)
+            grand_trains.append(train_sequences)
+        grand_train = np.array(grand_trains) # (grand_train: (301, 76, 25/2, 1) )
+        grand_train_reshaped = grand_train.reshape(grand_train.shape[0], grand_train.shape[1]*grand_train.shape[2], grand_train.shape[3])
+    else:
+        # If x_trains is empty, create empty arrays with appropriate dimension for reshaping later
+        grand_train = np.array([])
+        # The shape must be (0, 0, num_features) to be compatible.
+        # We can get num_features from the test set.
+        num_features = x_tests.shape[-1] if x_tests.ndim > 1 else 1
+        grand_train_reshaped = np.empty((0, 0, num_features))
+
     for grand in range(len(x_tests)):
         sub_x_tests = _create_sequences(x_tests[grand], nest_length, step)
         test_sequences, freq = torch_fft_transform(sub_x_tests)
@@ -248,7 +256,13 @@ def load_PSM(seq_length=100, stride=1, historical=False):
     # seq. length: 60:30 (ref. )
     # source: https://github.com/eBay/RANSynCoders
     # interval:  equally-spaced 1 minute apart
-    path = f'./datasets/PSM'
+    
+    # --- Path Correction ---
+    # The 'datasets' directory is inside the 'dualflsim' package, relative to this script.
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # Go up one directory from 'utils' to the 'dualflsim' package root
+    package_root = os.path.dirname(script_dir)
+    path = os.path.join(package_root, 'datasets', 'PSM')
 
     x_train, x_valid, x_test = [], [], []
     y_valid, y_test = [], []
@@ -263,13 +277,17 @@ def load_PSM(seq_length=100, stride=1, historical=False):
     train_df = scaler.fit_transform(train_df)
     test_df = scaler.transform(test_df)
 
+    print(f"[DEBUG in data_loader.py] Shape of test_df after loading: {test_df.shape}")
+
     valid_idx = int(test_df.shape[0] * 0.3)
     valid_df = test_df[:valid_idx]
 
     if seq_length > 0:
         x_train.append(_create_sequences(train_df, seq_length, stride, historical))
         x_valid.append(_create_sequences(valid_df, seq_length, stride, historical))
+        
         x_test.append(_create_sequences(test_df, seq_length, stride, historical))
+        
         y_test.append(np.expand_dims(_create_sequences(labels, seq_length, stride), axis=-1))
     else:
         x_train.append(train_df)
