@@ -1,6 +1,7 @@
 """DualFLSim: A Flower / PyTorch app."""
 
 from collections import OrderedDict
+from typing import Optional
 import numpy as np
 import torch
 import torch.nn as nn
@@ -24,6 +25,7 @@ if project_root not in sys.path:
 
 # Import the data loading and processing logic from the copied utils
 from utils.data_loader import load_tods, TrainingLoader, GeneralLoader, generate_frequency_grandwindow, _create_sequences, load_PSM
+from utils.config import load_config
 
 
 class FederatedDualTF(nn.Module):
@@ -41,6 +43,7 @@ def load_data(
     freq_batch_size: int = 16,
     seq_length: int = 50,
     dirichlet_alpha: float = 2.0,
+    nest_length: Optional[int] = None,
 ):
     """Load and partition the time-series data."""
     # Load the full dataset using the function from the original project
@@ -72,8 +75,10 @@ def load_data(
     testloader_time = DataLoader(dataset=test_dataset_time, batch_size=time_batch_size, shuffle=False, num_workers=2, pin_memory=True, persistent_workers=True)
 
     # --- Federated Partitioning (Frequency Domain) ---
-    # Use a default nest_length from the original project
-    nest_length = 25
+    # Resolve nest_length from argument or configuration (single source of truth)
+    if nest_length is None:
+        cfg = load_config()
+        nest_length = int(cfg.get('model', {}).get('freq', {}).get('nest_length', 25))
     # Generate frequency data for the client's partition
     freq_dict = generate_frequency_grandwindow(x_train_partition, x_test, y_test, nest_length, step=1)
     x_train_freq_partition = freq_dict['grand_train_reshaped']
@@ -95,6 +100,7 @@ def load_centralized_test_data(
     time_batch_size: int = 64,
     freq_batch_size: int = 16,
     seq_length: int = 50,
+    nest_length: Optional[int] = None,
 ):
     """Load the centralized (full) test dataset."""
     data_dict = load_PSM(seq_length=seq_length, stride=1)
@@ -110,7 +116,9 @@ def load_centralized_test_data(
     testloader_time = DataLoader(dataset=test_dataset_time, batch_size=time_batch_size, shuffle=False, num_workers=2, pin_memory=True, persistent_workers=True)
 
     # Create Frequency-Domain DataLoader
-    nest_length = 25
+    if nest_length is None:
+        cfg = load_config()
+        nest_length = int(cfg.get('model', {}).get('freq', {}).get('nest_length', 25))
     # Note: We pass dummy empty arrays for train data as we only need the test set
     freq_dict = generate_frequency_grandwindow(np.array([]), x_test, y_test, nest_length, step=1)
     x_test_freq = freq_dict['grand_test_reshaped']

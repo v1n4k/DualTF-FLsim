@@ -77,7 +77,8 @@ def generate_time_evaluation_array(model, testloader_time, device, dataset="PSM"
                 series_u = torch.nan_to_num(series[u], nan=0.0, posinf=0.0, neginf=0.0)
                 kl_term_1 = my_kl_loss(series_u, prior_norm.detach())
                 kl_term_2 = my_kl_loss(prior_norm.detach(), series_u)
-                series_loss += (kl_term_1 + kl_term_2)
+                # Reduce over sequence dim to match [B]
+                series_loss += (kl_term_1 + kl_term_2).mean(dim=1)
 
             series_loss /= len(prior)
 
@@ -101,6 +102,8 @@ def generate_time_evaluation_array(model, testloader_time, device, dataset="PSM"
     # Concatenate all scores and labels
     all_scores = np.concatenate(test_scores)
     all_labels = np.concatenate(test_labels)
+    # Ensure labels are 1D to align with evaluation array row
+    all_labels = np.asarray(all_labels).reshape(-1)
 
     # Create evaluation array
     test_seq_length = len(all_scores)
@@ -197,7 +200,7 @@ def generate_freq_evaluation_array(model, testloader_freq, device, dataset="PSM"
                 series_u = torch.nan_to_num(series[u], nan=0.0, posinf=0.0, neginf=0.0)
                 kl_term_1 = my_kl_loss(series_u, prior_norm.detach())
                 kl_term_2 = my_kl_loss(prior_norm.detach(), series_u)
-                series_loss += (kl_term_1 + kl_term_2)
+                series_loss += (kl_term_1 + kl_term_2).mean(dim=1)
 
             series_loss /= len(prior)
 
@@ -258,12 +261,15 @@ def generate_freq_evaluation_array(model, testloader_freq, device, dataset="PSM"
         if grand_evaluation_array[2][s] > mean_score:
             grand_evaluation_array[3][s] = 1  # 'Pred'
 
-    # Set ground truth (expand labels to match original length)
+    # Set ground truth (expand labels to match original length) robustly
     if len(all_labels) > 0:
-        expanded_labels = np.repeat(all_labels, original_length // len(all_labels))
-        if len(expanded_labels) < original_length:
-            expanded_labels = np.pad(expanded_labels, (0, original_length - len(expanded_labels)), 'edge')
-        grand_evaluation_array[4] = expanded_labels[:original_length]  # 'GT'
+        if original_length <= len(all_labels):
+            expanded_labels = all_labels[:original_length]
+        else:
+            reps = int(np.ceil(original_length / len(all_labels)))
+            expanded_labels = np.repeat(all_labels, reps)[:original_length]
+    expanded_labels = np.asarray(expanded_labels).reshape(-1)
+    grand_evaluation_array[4] = expanded_labels.astype(float)
 
     print(f'Freq Evaluation Array Shape: {grand_evaluation_array.shape}')
 

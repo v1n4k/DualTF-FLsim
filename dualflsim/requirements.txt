@@ -4,3 +4,5 @@ numpy
 scikit-learn
 pandas
 tqdm
+pyyaml
+wandb

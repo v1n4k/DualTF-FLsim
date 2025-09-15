@@ -16,6 +16,7 @@ from dualflsim.task import (
     train,
     test,
 )
+from utils.config import load_config
 
 # Define Flower Client and client_fn
 class FlowerClient(NumPyClient):
@@ -129,18 +130,30 @@ def client_fn(context: Context):
         torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "2")))
     except Exception:
         pass
-    # Load model and data
-    # Define model configurations based on the original project's defaults
-    # For PSM dataset, the number of features (channels) is 25
-    # Set sequence length and nest length as requested
-    seq_len = 100
-    time_model_args = {'win_size': seq_len, 'enc_in': 25, 'c_out': 25, 'e_layers': 3}
-    # The input to the frequency model depends on the `nest_length` used in data generation
-    nest_length = 25
+    # Load configuration (client reads same YAML; environment variable can point to a specific file)
+    cfg = load_config(os.environ.get("DUALFLSIM_CONFIG"))
+    MODEL_CFG = cfg.get("model", {})
+    DATA_CFG = cfg.get("data", {})
+
+    # Load model and data from config
+    seq_len = int(MODEL_CFG.get("seq_len", 100))
+    time_cfg = MODEL_CFG.get("time", {})
+    freq_cfg = MODEL_CFG.get("freq", {})
+    time_model_args = {
+        'win_size': seq_len,
+        'enc_in': int(time_cfg.get('enc_in', 25)),
+        'c_out': int(time_cfg.get('c_out', 25)),
+        'e_layers': int(time_cfg.get('e_layers', 3)),
+    }
+    nest_length = int(freq_cfg.get("nest_length", 25))
     freq_win_size = (seq_len - nest_length + 1) * (nest_length // 2)
-    # Frequency grand-window keeps the feature dimension (25) as channels
-    # Reduce heads to cut attention memory in freq model
-    freq_model_args = {'win_size': freq_win_size, 'enc_in': 25, 'c_out': 25, 'e_layers': 3, 'n_heads': 4}
+    freq_model_args = {
+        'win_size': freq_win_size,
+        'enc_in': int(freq_cfg.get('enc_in', 25)),
+        'c_out': int(freq_cfg.get('c_out', 25)),
+        'e_layers': int(freq_cfg.get('e_layers', 3)),
+        'n_heads': int(freq_cfg.get('n_heads', 4)),
+    }
     net = FederatedDualTF(time_model_args, freq_model_args)
     
     partition_id = int(context.node_config["partition-id"])
@@ -150,10 +163,11 @@ def client_fn(context: Context):
     trainloader_time, valloader_time, trainloader_freq, valloader_freq = load_data(
         partition_id=partition_id, 
         num_partitions=num_partitions,
-        time_batch_size=64,
-        freq_batch_size=16,
-        dirichlet_alpha=2.0,  # Moderately balanced quantity split for PSM
-        seq_length=seq_len,
+        time_batch_size=int(DATA_CFG.get('time_batch_size', 64)),
+        freq_batch_size=int(DATA_CFG.get('freq_batch_size', 16)),
+        dirichlet_alpha=float(DATA_CFG.get('dirichlet_alpha', 2.0)),
+        seq_length=int(DATA_CFG.get('seq_length', seq_len)),
+        nest_length=nest_length,
     )
 
     # Return Client instance with all dataloaders

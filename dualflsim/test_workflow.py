@@ -16,6 +16,14 @@ import torch
 import numpy as np
 from pathlib import Path
 
+# Make core symbols available globally for subsequent tests
+# Make core symbols available globally for subsequent tests
+from dualflsim.task import FederatedDualTF, get_weights, set_weights  # noqa: E402
+
+# Constants to keep tests fast
+TEST_SEQ_LEN = 16
+TEST_NEST_LEN = 8
+
 
 def test_imports():
     """Test if all required modules can be imported."""
@@ -48,14 +56,15 @@ def test_model_creation():
     print("🧪 Testing model creation...")
 
     try:
-        seq_len = 100
+        seq_len = TEST_SEQ_LEN
+        nest_len = TEST_NEST_LEN
         time_model_args = {'win_size': seq_len, 'enc_in': 25, 'c_out': 25, 'e_layers': 3}
         freq_model_args = {
-            'win_size': (seq_len - 25 + 1) * (25 // 2),
+            'win_size': (seq_len - nest_len + 1) * (nest_len // 2),
             'enc_in': 25,
             'c_out': 25,
             'e_layers': 3,
-            'n_heads': 4,
+            'n_heads': 2,
         }
 
         model = FederatedDualTF(time_model_args, freq_model_args)
@@ -82,9 +91,10 @@ def test_data_loading():
 
         # Test centralized data loading
         testloader_time, testloader_freq = load_centralized_test_data(
-            time_batch_size=32,
-            freq_batch_size=8,
-            seq_length=100,
+            time_batch_size=16,
+            freq_batch_size=4,
+            seq_length=TEST_SEQ_LEN,
+            nest_length=TEST_NEST_LEN,
         )
 
         time_size = len(testloader_time.dataset) if testloader_time else 0
@@ -114,14 +124,15 @@ def test_array_generation_logic():
             return False
 
         # Create model
-        seq_len = 100
+        seq_len = TEST_SEQ_LEN
+        nest_len = TEST_NEST_LEN
         time_model_args = {'win_size': seq_len, 'enc_in': 25, 'c_out': 25, 'e_layers': 3}
         freq_model_args = {
-            'win_size': (seq_len - 25 + 1) * (25 // 2),
+            'win_size': (seq_len - nest_len + 1) * (nest_len // 2),
             'enc_in': 25,
             'c_out': 25,
             'e_layers': 3,
-            'n_heads': 4,
+            'n_heads': 2,
         }
 
         from dualflsim.task import FederatedDualTF

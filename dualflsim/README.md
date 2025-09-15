@@ -41,6 +41,21 @@ Install the required Python packages using the provided `requirements.txt` file.
 pip install -r requirements.txt
 ```
 
+### 2.1 Configuration (single source of truth)
+
+All run parameters are controlled via a YAML config at `configs/default.yaml`. You can provide a custom file via:
+
+- Environment: `export DUALFLSIM_CONFIG=/path/to/your.yaml`
+- CLI: `python run_simulation.py /path/to/your.yaml`
+
+Important consistency rules:
+- `model.seq_len` must equal `data.seq_length` (window length for TimeTransformer and data windows)
+- For PSM, keep `enc_in` and `c_out` at 25 for both time and freq models
+- `model.freq.nest_length` is used for frequency grand-windows, centralized tests, and the frequency model; it’s passed everywhere from config
+- Client counts: `simulation.min_available_clients` and `simulation.min_fit_clients` must be ≤ `simulation.num_clients`
+
+You can change any parameter in the YAML without editing code.
+
 ### 3. Prepare the Datasets
 
 This implementation uses the datasets from the original DualTF project. Ensure the `datasets` directory is present in the project root and contains the necessary data files (e.g., from the NeurIPSTS collection).
@@ -69,6 +84,12 @@ python run_simulation.py
 ```
 
 This will initialize a Ray cluster, create 10 virtual clients (distributed across 4 GPUs), and run the federated training and evaluation process for 3 rounds.
+
+Optional with a custom config:
+
+```bash
+python run_simulation.py /path/to/your.yaml
+```
 
 ## How It Works
 
@@ -100,3 +121,40 @@ INFO :       'recall': [(1, 0.6287), (2, ...), (3, ...)]}
 -   **F1-Score**: The primary metric for evaluating the model's balance between precision and recall.
 -   **Precision**: Indicates the reliability of the model's anomaly predictions.
 -   **Recall**: Indicates the model's ability to find all true anomalies.
+
+## Experiment tracking (optional)
+
+We support Weights & Biases tracking behind a config flag. To enable:
+
+1. Log in once: run `wandb login` (or set the `WANDB_API_KEY` env var).
+2. In `configs/default.yaml`, set:
+
+```
+wandb:
+    enabled: true
+    project: DualTF-FLSim
+    entity: your_wandb_entity   # optional
+    run_name: my-experiment     # optional
+    tags: [fl, dualtf, psm]
+```
+
+What gets logged:
+- Per-round aggregated training loss and clients used
+- Optional server-side evaluation metrics if `evaluation.enabled: true`
+- Final saved time/freq arrays are uploaded as artifacts when generated
+
+Tracking is a no-op when `wandb.enabled` is false or the package is not installed.
+
+## Switch strategies: FedProx vs SCAFFOLD
+
+You can toggle the server strategy in `configs/default.yaml`:
+
+```
+strategy:
+    type: scaffold   # or 'fedprox'
+```
+
+- scaffold: Enables SCAFFOLD-style control variates. The server sends control bytes to clients; the client computes and returns delta_ci for server updates. We force `proximal_mu` to 0 when using SCAFFOLD.
+- fedprox: Uses classic FedProx. Set `training.proximal_mu` to a non-zero value if desired (e.g., 0.01). No SCAFFOLD fields are exchanged with clients.
+
+Both modes log per-round aggregated training loss (and server metrics if evaluation is enabled). Post-training array generation works the same in either mode.

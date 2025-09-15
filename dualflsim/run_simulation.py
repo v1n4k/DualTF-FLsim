@@ -25,19 +25,29 @@ import io
 
 # Import array generation functionality
 from utils.array_generator import generate_evaluation_arrays
+from utils.config import load_config
+from utils.wandb_utils import maybe_init_wandb, log_metrics, log_artifact, finish as wandb_finish
+
+
+from typing import Optional
+
+def _get_cfg_path_from_env_or_arg() -> Optional[str]:
+    import os
+    import sys
+    # Allow CLI: python run_simulation.py /path/to/config.yaml
+    if len(sys.argv) >= 2 and sys.argv[1].endswith(('.yml', '.yaml')):
+        return sys.argv[1]
+    return os.environ.get("DUALFLSIM_CONFIG")
 
 
 def fit_config(server_round: int) -> Dict[str, fl.common.Scalar]:
     """Return training configuration dict for each round."""
-    config = {
+    return {
         "server_round": server_round,
-        "local_epochs": 5,
-        # FedProx disabled for SCAFFOLD (kept for compatibility)
-        "proximal_mu": 0.0,
-        # Client learning rate for both time/freq optimizers
-    "lr": 1e-4,
+        "local_epochs": TRAINING_CFG["local_epochs"],
+        "proximal_mu": TRAINING_CFG["proximal_mu"],
+        "lr": float(TRAINING_CFG["lr"]),
     }
-    return config
 
 
 def aggregate_metrics(metrics: List[Tuple[int, Metrics]]) -> Metrics:
@@ -57,6 +67,8 @@ class SaveResultsStrategy(FedProx):
         with open("simulation_summary.txt", "w") as f:
             f.write("Federated Learning Simulation Summary\n")
             f.write("="*40 + "\n\n")
+        # Track latest aggregated parameters for post-training array generation
+        self.latest_parameters: Optional[fl.common.Parameters] = None
 
     # When using a server-side evaluate_fn, aggregate_evaluate is not called.
     # Override evaluate to always persist results regardless of evaluation mode.
@@ -98,31 +110,98 @@ class SaveResultsStrategy(FedProx):
         
         return aggregated_loss, aggregated_metrics
 
+    def aggregate_fit(
+        self,
+        server_round: int,
+        results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes]],
+        failures: List[BaseException],
+    ) -> Tuple[fl.common.Parameters, Dict[str, fl.common.Scalar]]:
+        # Let FedProx perform the standard FedAvg + proximal updates
+        aggregated_parameters, aggregated_metrics = super().aggregate_fit(server_round, results, failures)
+        # Record latest parameters for downstream post-training generation
+        try:
+            if aggregated_parameters is not None:
+                self.latest_parameters = aggregated_parameters
+        except Exception:
+            pass
+        # Aggregate client-side train_loss if provided and log via wandb
+        try:
+            total_examples = 0
+            sum_loss = 0.0
+            for _, fr in results:
+                m = getattr(fr, "metrics", {}) or {}
+                if "train_loss" in m and isinstance(m["train_loss"], (int, float)):
+                    n = int(getattr(fr, "num_examples", 0))
+                    total_examples += n
+                    sum_loss += float(m["train_loss"]) * n
+            if total_examples > 0:
+                avg_loss = sum_loss / float(total_examples)
+                if isinstance(aggregated_metrics, dict):
+                    aggregated_metrics["train_loss"] = float(avg_loss)
+                log_metrics({"train/avg_loss": float(avg_loss), "train/clients_used": float(len(results))}, step=server_round)
+        except Exception:
+            pass
+        return aggregated_parameters, aggregated_metrics
+
 
 def main():
     # 1. Optionally initialize Ray. We'll use all 4 GPUs for training clients
     # to maximize parallelism, then use 1 GPU for post-training inference.
-    ray.init(num_cpus=32, num_gpus=4, ignore_reinit_error=True)
+    # Load configuration (YAML or defaults)
+    cfg = load_config(_get_cfg_path_from_env_or_arg())
+    # Optional experiment tracking
+    maybe_init_wandb(cfg)
+
+    # Unpack commonly used sections
+    global TRAINING_CFG
+    TRAINING_CFG = cfg.get("training", {})
+    MODEL_CFG = cfg.get("model", {})
+    DATA_CFG = cfg.get("data", {})
+    SIM_CFG = cfg.get("simulation", {})
+    RAY_CFG = cfg.get("ray", {})
+    RES_CFG = cfg.get("resources", {}).get("client", {})
+    SCAFFOLD_CFG = cfg.get("scaffold", {})
+    STRAT_CFG = cfg.get("strategy", {})
+    EVAL_CFG = cfg.get("evaluation", {})
+    POST_CFG = cfg.get("post_training", {})
+
+    # Initialize Ray from config
+    ray.init(
+        num_cpus=int(RAY_CFG.get("num_cpus", 32)),
+        num_gpus=float(RAY_CFG.get("num_gpus", 4)),
+        ignore_reinit_error=bool(RAY_CFG.get("ignore_reinit_error", True)),
+    )
     print("Ray initialized.")
     print(f"Ray resources: {ray.available_resources()}")
 
     # 2. Define the client resources to 4cpus + 1gpu
     # Use all 4 GPUs for clients during training for maximum parallelism
-    client_resources = {"num_cpus": 4, "num_gpus": 1}
+    client_resources = {
+        "num_cpus": int(RES_CFG.get("num_cpus", 4)),
+        "num_gpus": float(RES_CFG.get("num_gpus", 1)),
+    }
 
     # 3. Define the strategy
     # Define model configurations based on the original project's defaults
     # For PSM dataset, the number of features (channels) is 25
-    seq_len = 100
-    time_model_args = {'win_size': seq_len, 'enc_in': 25, 'c_out': 25, 'e_layers': 3}
+    seq_len = int(MODEL_CFG.get("seq_len", 100))
+    time_cfg = MODEL_CFG.get("time", {})
+    freq_cfg = MODEL_CFG.get("freq", {})
+    time_model_args = {
+        'win_size': seq_len,
+        'enc_in': int(time_cfg.get('enc_in', 25)),
+        'c_out': int(time_cfg.get('c_out', 25)),
+        'e_layers': int(time_cfg.get('e_layers', 3)),
+    }
     # Frequency grand-window keeps the feature dimension (25) as channels
     # Sequence length becomes (seq_len - nest_len + 1) * floor(nest_len/2)
+    nest_len = int(freq_cfg.get('nest_length', 25))
     freq_model_args = {
-        'win_size': (seq_len - 25 + 1) * (25 // 2),
-        'enc_in': 25,
-        'c_out': 25,
-        'e_layers': 3,
-        'n_heads': 4,  # Align with clients to avoid shape mismatch and reduce memory
+        'win_size': (seq_len - nest_len + 1) * (nest_len // 2),
+        'enc_in': int(freq_cfg.get('enc_in', 25)),
+        'c_out': int(freq_cfg.get('c_out', 25)),
+        'e_layers': int(freq_cfg.get('e_layers', 3)),
+        'n_heads': int(freq_cfg.get('n_heads', 4)),
     }
 
     # Initialize model parameters
@@ -135,9 +214,10 @@ def main():
     # Preload centralized test dataloaders once to avoid rebuilding/grandwindow every round
     print("[Server] Preloading centralized test dataloaders...")
     testloader_time_global, testloader_freq_global = load_centralized_test_data(
-        time_batch_size=128,
-        freq_batch_size=8,
-        seq_length=seq_len,
+        time_batch_size=int(DATA_CFG.get('time_batch_size', 128)),
+        freq_batch_size=int(DATA_CFG.get('freq_batch_size', 8)),
+        seq_length=int(DATA_CFG.get('seq_length', seq_len)),
+        nest_length=nest_len,
     )
     print(f"[Server] Test sizes: time={len(testloader_time_global.dataset)}, freq={len(testloader_freq_global.dataset)}")
 
@@ -218,10 +298,27 @@ def main():
             aggregated_parameters = ndarrays_to_parameters(new_weights)
             aggregated_metrics: Dict[str, fl.common.Scalar] = {}
 
+            # Aggregate and log training loss to wandb if available
+            try:
+                total_examples = 0
+                sum_loss = 0.0
+                for _, fr in filtered_results:
+                    m = getattr(fr, "metrics", {}) or {}
+                    if "train_loss" in m and isinstance(m["train_loss"], (int, float)):
+                        n = int(getattr(fr, "num_examples", 0))
+                        total_examples += n
+                        sum_loss += float(m["train_loss"]) * n
+                if total_examples > 0:
+                    avg_loss = sum_loss / float(total_examples)
+                    aggregated_metrics["train_loss"] = float(avg_loss)
+                    log_metrics({"train/avg_loss": float(avg_loss), "train/clients_used": float(len(filtered_results))}, step=server_round)
+            except Exception:
+                pass
+
             # Update control variates (damped and finite)
             if deltas:
                 sum_delta = [np.zeros_like(a) for a in self.global_c]
-                alpha = 0.1  # damping factor
+                alpha = float(SCAFFOLD_CFG.get('damping', 0.1))  # damping factor
                 for cid, delta in zip(cids, deltas):
                     if cid not in self.client_ci:
                         self.client_ci[cid] = [np.zeros_like(a) for a in self.global_c]
@@ -239,15 +336,15 @@ def main():
 
     # Server-side evaluation to centralize threshold sweep
     eval_state: Dict[str, float] = {}
-    total_rounds: int = 10
+    total_rounds: int = int(SIM_CFG.get("total_rounds", 10))
 
     def server_evaluate_fn(
         server_round: int,
         params: List,  # already a list of ndarrays provided by Flower
         config: Dict[str, fl.common.Scalar],
     ) -> Tuple[float, Dict[str, fl.common.Scalar]]:
-        # Evaluate every 3 rounds and on the final round
-        if (server_round % 3 != 0) and (server_round != total_rounds):
+        # Evaluate every N rounds and on the final round if enabled
+        if not bool(EVAL_CFG.get("enabled", False)):
             print(f"[Server] Skipping evaluation for round {server_round} (evaluate every 3 rounds & final round)")
             return None
         import os
@@ -295,8 +392,8 @@ def main():
         # Evaluate using existing test() which handles both models and threshold sweep
         # Use fast settings for periodic rounds; thorough on final round
         is_final = (server_round == total_rounds)
-        thr_cnt = 1000 if is_final else 256
-        step_val = 1 if is_final else 5
+        thr_cnt = int(EVAL_CFG.get("num_thresholds_final", 1000)) if is_final else int(EVAL_CFG.get("num_thresholds_periodic", 256))
+        step_val = int(EVAL_CFG.get("step", 5))
 
         loss, metrics = test(
             net,
@@ -304,12 +401,12 @@ def main():
             testloader_freq,
             device,
             eval_state=eval_state,
-            min_consecutive=10,
+            min_consecutive=int(EVAL_CFG.get('min_consecutive', 10)),
             num_thresholds=thr_cnt,
-            seq_length=50,
+            seq_length=int(EVAL_CFG.get('seq_length', 50)),
             step=step_val,
-            threshold_quantile_range=(0.01, 0.99),
-            prefer_gpu_sweep=True,
+            threshold_quantile_range=tuple(EVAL_CFG.get('threshold_quantile_range', [0.01, 0.99])),
+            prefer_gpu_sweep=bool(EVAL_CFG.get('prefer_gpu_sweep', True)),
         )
         # Cleanup: free VRAM on the reserved eval GPU
         try:
@@ -321,35 +418,60 @@ def main():
             pass
         gc.collect()
         print(f"[Server] Round {server_round} evaluation done: {metrics}")
+        # Log evaluation metrics to wandb
+        try:
+            to_log = {"server/loss": float(loss)}
+            for k, v in metrics.items():
+                if isinstance(v, (int, float)):
+                    to_log[f"server/{k}"] = float(v)
+            log_metrics(to_log, step=server_round)
+        except Exception:
+            pass
         return float(loss), metrics
 
-    # Define strategy (standard partial participation): only selected clients get the global
-    strategy = ScaffoldStrategy(
-        fraction_fit=0.25,   # we'll rely on min_fit_clients to select exactly 1
-        fraction_evaluate=0.0,  # Use server-side evaluation only
-        min_available_clients=6, # at least 6 clients must be connected to proceed
-        min_fit_clients=6, # at least 6 clients to ensure diversity
-        initial_parameters=parameters,
-        on_fit_config_fn=fit_config,
-        evaluate_metrics_aggregation_fn=aggregate_metrics,
-        # Disable FedProx term when running SCAFFOLD; keep 0.0 for clarity
-        proximal_mu=0.0,
-        # No server evaluation during training - will do comprehensive evaluation after
-        evaluate_fn=None,
-    )
+    # Define strategy (standard partial participation): choose by config
+    strategy_type = str(STRAT_CFG.get("type", "scaffold")).lower()
+    if strategy_type == "fedprox":
+        print("[Server] Using FedProx strategy")
+        strategy = SaveResultsStrategy(
+            fraction_fit=float(SIM_CFG.get('fraction_fit', 0.25)),
+            fraction_evaluate=float(SIM_CFG.get('fraction_evaluate', 0.0)),
+            min_available_clients=int(SIM_CFG.get('min_available_clients', 6)),
+            min_fit_clients=int(SIM_CFG.get('min_fit_clients', 6)),
+            initial_parameters=parameters,
+            on_fit_config_fn=fit_config,
+            evaluate_metrics_aggregation_fn=aggregate_metrics,
+            proximal_mu=float(TRAINING_CFG.get('proximal_mu', 0.0)),
+            evaluate_fn=None if not bool(EVAL_CFG.get('enabled', False)) else server_evaluate_fn,
+        )
+    else:
+        print("[Server] Using SCAFFOLD strategy")
+        strategy = ScaffoldStrategy(
+            fraction_fit=float(SIM_CFG.get('fraction_fit', 0.25)),
+            fraction_evaluate=float(SIM_CFG.get('fraction_evaluate', 0.0)),
+            min_available_clients=int(SIM_CFG.get('min_available_clients', 6)),
+            min_fit_clients=int(SIM_CFG.get('min_fit_clients', 6)),
+            initial_parameters=parameters,
+            on_fit_config_fn=fit_config,
+            evaluate_metrics_aggregation_fn=aggregate_metrics,
+            # Disable FedProx term when running SCAFFOLD; keep 0.0 for clarity
+            proximal_mu=0.0,
+            # Keep server evaluation controlled by EVAL_CFG.enabled; set evaluate_fn accordingly
+            evaluate_fn=None if not bool(EVAL_CFG.get('enabled', False)) else server_evaluate_fn,
+        )
 
     # 4. Start the simulation using fl.simulation.start_simulation
     print("Starting Flower simulation...")
     history = fl.simulation.start_simulation(
         client_fn=client_fn,
-        num_clients=24,
+        num_clients=int(SIM_CFG.get('num_clients', 24)),
         client_resources=client_resources,
-        config=ServerConfig(num_rounds=total_rounds), # More rounds to see convergence
+        config=ServerConfig(num_rounds=total_rounds),
         # Use all 4 GPUs for training clients
         ray_init_args={
-            "num_cpus": 32,
-            "num_gpus": 4,
-            "ignore_reinit_error": True,
+            "num_cpus": int(RAY_CFG.get('num_cpus', 32)),
+            "num_gpus": float(RAY_CFG.get('num_gpus', 4)),
+            "ignore_reinit_error": bool(RAY_CFG.get('ignore_reinit_error', True)),
         },
         strategy=strategy,
     )
@@ -383,31 +505,41 @@ def main():
     final_model.to(post_train_device)
 
     # Generate evaluation arrays using centralized test data
-    print("[Post-Training] Generating evaluation arrays...")
-    try:
-        time_path, freq_path, time_df, freq_df = generate_evaluation_arrays(
-            model=final_model,
-            testloader_time=testloader_time_global,
-            testloader_freq=testloader_freq_global,
-            device=post_train_device,
-            dataset="PSM",  # Using PSM dataset as configured
-            form=None,
-            data_num=0,
-            seq_length=seq_len,
-            nest_length=25
-        )
+    if bool(POST_CFG.get('generate_arrays', True)):
+        print("[Post-Training] Generating evaluation arrays...")
+        try:
+            time_path, freq_path, time_df, freq_df = generate_evaluation_arrays(
+                model=final_model,
+                testloader_time=testloader_time_global,
+                testloader_freq=testloader_freq_global,
+                device=post_train_device,
+                dataset=str(POST_CFG.get('dataset', 'PSM')),
+                form=None,
+                data_num=int(POST_CFG.get('data_num', 0)),
+                seq_length=int(POST_CFG.get('seq_length', seq_len)),
+                nest_length=int(POST_CFG.get('nest_length', nest_len)),
+            )
 
-        print(f"[Post-Training] Arrays saved to:")
-        print(f"  - Time array: {time_path}")
-        print(f"  - Freq array: {freq_path}")
-        print(f"[Post-Training] Array shapes:")
-        print(f"  - Time: {time_df.shape}")
-        print(f"  - Freq: {freq_df.shape}")
+            print(f"[Post-Training] Arrays saved to:")
+            print(f"  - Time array: {time_path}")
+            print(f"  - Freq array: {freq_path}")
+            print(f"[Post-Training] Array shapes:")
+            print(f"  - Time: {time_df.shape}")
+            print(f"  - Freq: {freq_df.shape}")
 
-    except Exception as e:
-        print(f"[Post-Training] Error generating arrays: {e}")
-        import traceback
-        traceback.print_exc()
+            # Optionally log arrays as artifacts
+            try:
+                if os.path.isfile(time_path):
+                    log_artifact(time_path, type_="array")
+                if os.path.isfile(freq_path):
+                    log_artifact(freq_path, type_="array")
+            except Exception:
+                pass
+
+        except Exception as e:
+            print(f"[Post-Training] Error generating arrays: {e}")
+            import traceback
+            traceback.print_exc()
 
     # Cleanup post-training resources
     try:
@@ -420,6 +552,12 @@ def main():
 
     print("=== Post-Training Array Generation Complete ===\n")
     print("Ready for evaluation! Use the generated arrays with evaluation_fl.py")
+
+    # Finish wandb run if started
+    try:
+        wandb_finish()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

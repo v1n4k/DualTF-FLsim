@@ -12,6 +12,7 @@ import subprocess
 import sys
 import os
 from pathlib import Path
+from utils.config import load_config
 
 
 def check_array_files(dataset="PSM", data_num=0):
@@ -43,6 +44,8 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='Run FL evaluation')
+    parser.add_argument('--config', type=str, default=None,
+                        help='Path to YAML config file (optional)')
     parser.add_argument('--dataset', type=str, default='PSM',
                         help='Dataset name (default: PSM)')
     parser.add_argument('--seq_length', type=int, default=100,
@@ -57,6 +60,20 @@ def main():
                         help='Step size (default: 1)')
 
     args = parser.parse_args()
+
+    # Load config and apply as defaults for missing args
+    cfg = load_config(args.config)
+    DATA_CFG = cfg.get('data', {})
+    POST_CFG = cfg.get('post_training', {})
+    # If user didn't pass explicit values, fill from config
+    if args.dataset == 'PSM' and 'dataset' in POST_CFG:
+        args.dataset = POST_CFG.get('dataset', args.dataset)
+    if args.seq_length == 100 and 'seq_length' in POST_CFG:
+        args.seq_length = int(POST_CFG.get('seq_length', args.seq_length))
+    if args.nest_length == 25 and 'nest_length' in POST_CFG:
+        args.nest_length = int(POST_CFG.get('nest_length', args.nest_length))
+    if args.data_num == 0 and 'data_num' in POST_CFG:
+        args.data_num = int(POST_CFG.get('data_num', args.data_num))
 
     print("🔍 FL Evaluation Runner")
     print("=" * 50)
