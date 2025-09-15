@@ -23,6 +23,9 @@ from dualflsim.task import (
 import numpy as np
 import io
 
+# Import array generation functionality
+from utils.array_generator import generate_evaluation_arrays
+
 
 def fit_config(server_round: int) -> Dict[str, fl.common.Scalar]:
     """Return training configuration dict for each round."""
@@ -97,15 +100,14 @@ class SaveResultsStrategy(FedProx):
 
 
 def main():
-    # 1. Optionally initialize Ray. We'll also pass ray_init_args to Flower
-    # so that it respects the same GPU reservation (3 GPUs for clients,
-    # leaving 1 GPU free for server-side evaluation).
-    ray.init(num_cpus=32, num_gpus=3, ignore_reinit_error=True)
+    # 1. Optionally initialize Ray. We'll use all 4 GPUs for training clients
+    # to maximize parallelism, then use 1 GPU for post-training inference.
+    ray.init(num_cpus=32, num_gpus=4, ignore_reinit_error=True)
     print("Ray initialized.")
     print(f"Ray resources: {ray.available_resources()}")
 
     # 2. Define the client resources to 4cpus + 1gpu
-    # Use 3 GPUs for clients; 1 GPU will be reserved for server eval
+    # Use all 4 GPUs for clients during training for maximum parallelism
     client_resources = {"num_cpus": 4, "num_gpus": 1}
 
     # 3. Define the strategy
@@ -237,7 +239,7 @@ def main():
 
     # Server-side evaluation to centralize threshold sweep
     eval_state: Dict[str, float] = {}
-    total_rounds: int = 30
+    total_rounds: int = 10
 
     def server_evaluate_fn(
         server_round: int,
@@ -332,7 +334,8 @@ def main():
         evaluate_metrics_aggregation_fn=aggregate_metrics,
         # Disable FedProx term when running SCAFFOLD; keep 0.0 for clarity
         proximal_mu=0.0,
-        evaluate_fn=server_evaluate_fn,
+        # No server evaluation during training - will do comprehensive evaluation after
+        evaluate_fn=None,
     )
 
     # 4. Start the simulation using fl.simulation.start_simulation
@@ -342,16 +345,81 @@ def main():
         num_clients=24,
         client_resources=client_resources,
         config=ServerConfig(num_rounds=total_rounds), # More rounds to see convergence
-        # Force Flower to initialize Ray with only 3 GPUs to reserve 1 GPU for server eval
+        # Use all 4 GPUs for training clients
         ray_init_args={
             "num_cpus": 32,
-            "num_gpus": 3,
+            "num_gpus": 4,
             "ignore_reinit_error": True,
         },
         strategy=strategy,
     )
 
     print("Simulation finished.")
+
+    # === POST-TRAINING ARRAY GENERATION ===
+    print("\n=== Starting Post-Training Array Generation ===")
+
+    # Get the final model parameters from the strategy
+    final_parameters = strategy.latest_parameters
+    if final_parameters is None:
+        print("[Warning] No final parameters found, using initial parameters")
+        final_parameters = parameters
+
+    # Convert parameters to numpy arrays
+    final_params_numpy = parameters_to_ndarrays(final_parameters)
+
+    # Setup device for post-training inference (any available GPU)
+    if torch.cuda.is_available() and torch.cuda.device_count() >= 1:
+        # Use GPU 0 (or any available GPU after training completes)
+        post_train_device = torch.device("cuda:0")
+        print(f"[Post-Training] Using {post_train_device} for array generation")
+    else:
+        post_train_device = torch.device("cpu")
+        print(f"[Post-Training] Using {post_train_device} for array generation")
+
+    # Create final model and load aggregated weights
+    final_model = FederatedDualTF(time_model_args, freq_model_args)
+    set_weights(final_model, final_params_numpy)
+    final_model.to(post_train_device)
+
+    # Generate evaluation arrays using centralized test data
+    print("[Post-Training] Generating evaluation arrays...")
+    try:
+        time_path, freq_path, time_df, freq_df = generate_evaluation_arrays(
+            model=final_model,
+            testloader_time=testloader_time_global,
+            testloader_freq=testloader_freq_global,
+            device=post_train_device,
+            dataset="PSM",  # Using PSM dataset as configured
+            form=None,
+            data_num=0,
+            seq_length=seq_len,
+            nest_length=25
+        )
+
+        print(f"[Post-Training] Arrays saved to:")
+        print(f"  - Time array: {time_path}")
+        print(f"  - Freq array: {freq_path}")
+        print(f"[Post-Training] Array shapes:")
+        print(f"  - Time: {time_df.shape}")
+        print(f"  - Freq: {freq_df.shape}")
+
+    except Exception as e:
+        print(f"[Post-Training] Error generating arrays: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # Cleanup post-training resources
+    try:
+        del final_model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+    except Exception:
+        pass
+
+    print("=== Post-Training Array Generation Complete ===\n")
+    print("Ready for evaluation! Use the generated arrays with evaluation_fl.py")
 
 
 if __name__ == "__main__":
