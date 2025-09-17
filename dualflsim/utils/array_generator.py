@@ -162,7 +162,7 @@ def generate_time_evaluation_array(model, testloader_time, device, dataset="PSM"
     return df
 
 
-def generate_freq_evaluation_array(model, testloader_freq, device, dataset="PSM", data_num=0, seq_length=100, nest_length=25):
+def generate_freq_evaluation_array(model, testloader_freq, device, dataset="PSM", data_num=0, seq_length=100, nest_length=25, target_length: int = None):
     """Generate frequency domain evaluation array similar to FreqReconstructor.
 
     Returns array with shape (5, len(test_seq)) and indices:
@@ -221,55 +221,50 @@ def generate_freq_evaluation_array(model, testloader_freq, device, dataset="PSM"
             test_labels.append(lbl.cpu().numpy())
 
     # Concatenate all scores and labels
-    all_scores = np.concatenate(test_scores)
-    all_labels = np.concatenate(test_labels)
+    all_scores = np.concatenate(test_scores) if len(test_scores) > 0 else np.array([])
+    all_labels = np.concatenate(test_labels) if len(test_labels) > 0 else np.array([])
 
-    # For frequency domain, we need to map back to the original sequence length
-    # Since freq data is shorter, we'll interpolate/expand to match original length
-    original_length = len(all_labels) * seq_length // len(all_scores) if len(all_scores) > 0 else seq_length
+    # Decide output length: align to target_length if provided (e.g., time array width)
+    out_len = int(target_length) if target_length is not None else (len(all_scores) if len(all_scores) > 0 else seq_length)
 
     # Create evaluation array for the mapped sequence
-    grand_evaluation_array = np.zeros((5, original_length))
+    grand_evaluation_array = np.zeros((5, out_len))
 
-    # Map frequency scores to sequence positions
-    for i in range(len(all_scores)):
-        start_pos = i
-        end_pos = min(start_pos + seq_length, original_length)
-        grand_evaluation_array[2][start_pos:end_pos] += all_scores[i]  # 'Avg(exp(RE))'
-        grand_evaluation_array[0][start_pos:end_pos] += nest_length  # '#SubSeq'
+    if len(all_scores) > 0:
+        # Interpolate frequency anomaly scores to desired length
+        x_old = np.linspace(0.0, 1.0, len(all_scores))
+        x_new = np.linspace(0.0, 1.0, out_len)
+        mapped_scores = np.interp(x_new, x_old, all_scores)
+    else:
+        mapped_scores = np.zeros(out_len)
 
-    # Calculate grand sequence counts
-    for timestamp in range(original_length):
-        if timestamp < seq_length - 1:
-            grand_context = timestamp + 1
-        elif timestamp >= seq_length - 1 and timestamp < original_length - seq_length + 1:
-            grand_context = seq_length
-        elif timestamp >= original_length - seq_length + 1:
-            grand_context = original_length - timestamp
+    # Fill Avg(exp(RE)) row
+    grand_evaluation_array[2, :] = mapped_scores
+
+    # '#GrandSeq' row: number of seq_length windows covering each position (same logic as time domain)
+    for t in range(out_len):
+        if t < seq_length - 1:
+            ctx = t + 1
+        elif t < out_len - seq_length + 1:
+            ctx = seq_length
         else:
-            grand_context = seq_length
-        grand_evaluation_array[1][timestamp] = grand_context  # '#GrandSeq'
+            ctx = out_len - t
+        grand_evaluation_array[1, t] = ctx
 
-    # Normalize the scores
-    for s in range(original_length):
-        if grand_evaluation_array[1][s] > 0:
-            grand_evaluation_array[2][s] = grand_evaluation_array[2][s] / grand_evaluation_array[1][s]
+    # '#SubSeq' row: indicative count; keep constant nest_length per position for compatibility
+    grand_evaluation_array[0, :] = float(nest_length)
 
-    # Generate predictions based on mean threshold
-    mean_score = np.mean(grand_evaluation_array[2])
-    for s in range(original_length):
-        if grand_evaluation_array[2][s] > mean_score:
-            grand_evaluation_array[3][s] = 1  # 'Pred'
+    # Predictions by mean threshold (not used by evaluator but kept for parity)
+    mean_score = float(np.mean(grand_evaluation_array[2, :])) if out_len > 0 else 0.0
+    grand_evaluation_array[3, :] = (grand_evaluation_array[2, :] > mean_score).astype(float)
 
-    # Set ground truth (expand labels to match original length) robustly
+    # GT row: expand labels to match length (not used by evaluator)
     if len(all_labels) > 0:
-        if original_length <= len(all_labels):
-            expanded_labels = all_labels[:original_length]
-        else:
-            reps = int(np.ceil(original_length / len(all_labels)))
-            expanded_labels = np.repeat(all_labels, reps)[:original_length]
-    expanded_labels = np.asarray(expanded_labels).reshape(-1)
-    grand_evaluation_array[4] = expanded_labels.astype(float)
+        reps = int(np.ceil(out_len / len(all_labels)))
+        expanded_labels = np.repeat(all_labels, reps)[:out_len]
+    else:
+        expanded_labels = np.zeros(out_len)
+    grand_evaluation_array[4, :] = np.asarray(expanded_labels).reshape(-1).astype(float)
 
     print(f'Freq Evaluation Array Shape: {grand_evaluation_array.shape}')
 
@@ -328,7 +323,9 @@ def generate_evaluation_arrays(model, testloader_time, testloader_freq, device,
         seq_length=seq_length
     )
 
-    # Generate frequency domain array
+    # Generate frequency domain array (aligned to time array width)
+    # We'll compute time_df first to determine target length
+    # Temporarily generate freq with default to compute later using target length
     freq_df = generate_freq_evaluation_array(
         model=model,
         testloader_freq=testloader_freq,
@@ -336,10 +333,28 @@ def generate_evaluation_arrays(model, testloader_time, testloader_freq, device,
         dataset=dataset,
         data_num=data_num,
         seq_length=seq_length,
-        nest_length=nest_length
+        nest_length=nest_length,
+        target_length=None
     )
 
     # Save both arrays
+    # If lengths mismatch, regenerate freq_df with aligned length
+    try:
+        if time_df.shape[1] != freq_df.shape[1]:
+            print(f"[ArrayGen WARN] Time ({time_df.shape[1]}) and Freq ({freq_df.shape[1]}) lengths differ. Regenerating freq array aligned to time length.")
+            freq_df = generate_freq_evaluation_array(
+                model=model,
+                testloader_freq=testloader_freq,
+                device=device,
+                dataset=dataset,
+                data_num=data_num,
+                seq_length=seq_length,
+                nest_length=nest_length,
+                target_length=time_df.shape[1],
+            )
+    except Exception:
+        pass
+
     time_path, freq_path = save_evaluation_arrays(
         time_df=time_df,
         freq_df=freq_df,

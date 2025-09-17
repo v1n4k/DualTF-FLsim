@@ -13,6 +13,8 @@ from tqdm import tqdm
 import argparse
 import sys
 from pathlib import Path
+import math
+import sklearn
 
 from sklearn.metrics import auc
 from sklearn.preprocessing import RobustScaler
@@ -23,6 +25,110 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 from utils.data_loader import load_PSM, normalization, _create_sequences
+
+
+# === TranAD-style adjusted prediction utilities (adapted from FedKO/utils/ad_util.py) ===
+def adjust_predicts_from_tranad(label, score, threshold=None, pred=None, calc_latency=False):
+    """
+    Calculate adjusted predict labels using given score/threshold (or given pred) and label.
+    This expands predicted positives to cover entire contiguous anomaly segments, reducing latency.
+    """
+    if len(score) != len(label):
+        raise ValueError("score and label must have the same length")
+    score = np.asarray(score)
+    label = np.asarray(label)
+    latency = 0
+    if pred is None:
+        predict = score > threshold
+    else:
+        predict = pred.copy()
+    actual = label > 0.1
+    anomaly_state = False
+    anomaly_count = 0
+    for i in range(len(score)):
+        if actual[i] and predict[i] and not anomaly_state:
+            anomaly_state = True
+            anomaly_count += 1
+            for j in range(i, 0, -1):
+                if not actual[j]:
+                    break
+                else:
+                    if not predict[j]:
+                        predict[j] = True
+                        latency += 1
+        elif not actual[i]:
+            anomaly_state = False
+        if anomaly_state:
+            predict[i] = True
+    if calc_latency:
+        return predict, latency / (anomaly_count + 1e-4)
+    else:
+        return predict
+
+
+def get_threshold_tranad(labels, scores, print_or_not=True):
+    """
+    Sweep a sparse set of thresholds, compute raw and TranAD-adjusted point-wise metrics,
+    and return the best metrics (by adjusted F1) together with ROC-AUC.
+    """
+    auc_val = sklearn.metrics.roc_auc_score(labels, scores)
+    thresholds_0 = np.asarray(scores).copy()
+    thresholds_0.sort()
+
+    thresholds = []
+    for i in range(len(thresholds_0)):
+        if i % 1000 == 0 or i == len(thresholds_0) - 1:
+            thresholds.append(thresholds_0[i])
+
+    best_precision = 0.0
+    best_recall = 0.0
+    best_f1 = 0.0
+    best_threshold = math.inf
+    best_f1_adjusted = 0.0
+    best_precision_adjusted = 0.0
+    best_recall_adjusted = 0.0
+
+    labels_np = np.asarray(labels).astype(int)
+    scores_np = np.asarray(scores).astype(float)
+
+    for threshold in thresholds:
+        y_pred_from_threshold = (scores_np >= threshold).astype(int)
+        precision = sklearn.metrics.precision_score(labels_np, y_pred_from_threshold, zero_division=0)
+        recall = sklearn.metrics.recall_score(labels_np, y_pred_from_threshold, zero_division=0)
+        f1 = sklearn.metrics.f1_score(labels_np, y_pred_from_threshold, zero_division=0)
+
+        y_pred_adjusted = adjust_predicts_from_tranad(labels_np, scores_np, pred=y_pred_from_threshold, threshold=threshold)
+        precision_adjusted = sklearn.metrics.precision_score(labels_np, y_pred_adjusted, zero_division=0)
+        recall_adjusted = sklearn.metrics.recall_score(labels_np, y_pred_adjusted, zero_division=0)
+        f1_adjusted = sklearn.metrics.f1_score(labels_np, y_pred_adjusted, zero_division=0)
+
+        if f1_adjusted > best_f1_adjusted:
+            best_precision = precision
+            best_recall = recall
+            best_f1 = f1
+            best_f1_adjusted = f1_adjusted
+            best_precision_adjusted = precision_adjusted
+            best_recall_adjusted = recall_adjusted
+            best_threshold = threshold
+
+    if print_or_not:
+        print('auc:', auc_val)
+        print('precision_adjusted:', best_precision_adjusted)
+        print('recall_adjusted:', best_recall_adjusted)
+        print('f1:', best_f1)
+        print('f1_adjusted:', best_f1_adjusted)
+        print('threshold:', best_threshold)
+
+    return (
+        auc_val,
+        best_precision,
+        best_recall,
+        best_f1,
+        best_precision_adjusted,
+        best_recall_adjusted,
+        best_f1_adjusted,
+        best_threshold,
+    )
 
 
 def _simulate_thresholds(rec_errors, n):
@@ -78,7 +184,19 @@ def load_evaluation_arrays(dataset="PSM", form=None, data_num=0):
 
 
 def total_evaluation(opts):
-    """Main evaluation function (adapted from original evaluation.py)."""
+    """Main evaluation function (adapted and extended).
+
+    Now supports evaluating multiple modes:
+    - time-only (normalized time reconstruction errors)
+    - freq-only (normalized freq exp(RE))
+    - fused (sum of normalized time and freq)
+    And for each mode, computes:
+    - Point Adjusted Evaluation (seq_length windows)
+    - Point-Wise Evaluation
+    - Released Point-Wise Evaluation (nest_length windows)
+    - TranAD-Adjusted Point-Wise Evaluation
+    Optionally writes a consolidated CSV to results_dir.
+    """
 
     # Load arrays
     time_array, freq_array = load_evaluation_arrays(
@@ -90,17 +208,31 @@ def total_evaluation(opts):
     if time_array is None or freq_array is None:
         return
 
-    print("Time Array:")
-    print(time_array)
-    print("\nFreq Array:")
-    print(freq_array)
+    if opts.verbose:
+        print("Time Array:")
+        print(time_array)
+        print("\nFreq Array:")
+        print(freq_array)
 
     # Extract reconstruction errors for fusion
-    time_rec = np.array(time_array.loc['Avg(RE)', :])
-    freq_rec = np.array(freq_array.loc['Avg(exp(RE))', :])
+    time_rec = np.array(time_array.loc['Avg(RE)', :]).reshape(-1, 1)
+    freq_rec = np.array(freq_array.loc['Avg(exp(RE))', :]).reshape(-1, 1)
 
-    time_rec = time_rec.reshape(-1, 1)
-    freq_rec = freq_rec.reshape(-1, 1)
+    # Align lengths if mismatched (original DualTF expects equal length from PKLs)
+    if len(time_rec) != len(freq_rec):
+        longer = len(time_rec) if len(time_rec) >= len(freq_rec) else len(freq_rec)
+        shorter_name = 'freq' if len(freq_rec) < len(time_rec) else 'time'
+        print(f"[WARN] Length mismatch between time ({len(time_rec)}) and freq ({len(freq_rec)}) arrays. Resampling {shorter_name} to length {longer} to align with original evaluation.")
+        if len(freq_rec) < len(time_rec):
+            # Resample freq to time length
+            x_old = np.linspace(0.0, 1.0, len(freq_rec))
+            x_new = np.linspace(0.0, 1.0, len(time_rec))
+            freq_rec = np.interp(x_new, x_old, freq_rec.ravel()).reshape(-1, 1)
+        else:
+            # Resample time to freq length (unlikely for PSM, but handle generically)
+            x_old = np.linspace(0.0, 1.0, len(time_rec))
+            x_new = np.linspace(0.0, 1.0, len(freq_rec))
+            time_rec = np.interp(x_new, x_old, time_rec.ravel()).reshape(-1, 1)
 
     # Normalize scores using RobustScaler (as in original)
     scaler = RobustScaler(unit_variance=True)
@@ -112,8 +244,11 @@ def total_evaluation(opts):
     freq_as = normalization(freq_rec)
 
     # Fusion: combine time and frequency scores
-    final_as = time_as + freq_as
-    final_as = final_as.flatten()  # Ensure it's 1D
+    final_as = (time_as + freq_as).flatten()  # fused
+
+    # Also prepare per-source modes
+    time_only_as = time_as.flatten()
+    freq_only_as = freq_as.flatten()
 
     # Load ground truth labels
     print("Loading ground truth labels...")
@@ -124,172 +259,205 @@ def total_evaluation(opts):
         print(f"Dataset {opts.dataset} not implemented yet")
         return
 
-    # Ensure labels and scores have compatible lengths
-    min_len = min(len(final_as), len(label))
-    final_as = final_as[:min_len]
-    label = label[:min_len]
+    # Helper to evaluate a single score vector with all methods
+    def evaluate_scores(scores_1d: np.ndarray, labels_1d: np.ndarray):
+        out = {}
+        # Align lengths
+        n = min(len(scores_1d), len(labels_1d))
+        s = scores_1d[:n]
+        y = labels_1d[:n]
 
-    print(f"Final evaluation lengths - Scores: {len(final_as)}, Labels: {len(label)}")
+        # Point Adjusted (seq_length)
+        thresholds = _simulate_thresholds(s, opts.thresh_num)
+        s_seq = _create_sequences(s, opts.seq_length, opts.step)
+        y_seq = _create_sequences(y, opts.seq_length, opts.step)
+        TP, TN, FP, FN = [], [], [], []
+        precision, recall, f1, fpr = [], [], [], []
+        for th in thresholds:
+            TP_t = TN_t = FP_t = FN_t = 0
+            for t in range(len(s_seq)):
+                true_anom = set(np.where(y_seq[t] == 1)[0])
+                pred_anom = set(np.where(s_seq[t] > th)[0])
+                if len(pred_anom) > 0 and len(pred_anom.intersection(true_anom)) > 0:
+                    TP_t += 1
+                elif len(pred_anom) == 0 and len(true_anom) == 0:
+                    TN_t += 1
+                elif len(pred_anom) > 0 and len(true_anom) == 0:
+                    FP_t += 1
+                elif len(pred_anom) == 0 and len(true_anom) > 0:
+                    FN_t += 1
+            TP.append(TP_t); TN.append(TN_t); FP.append(FP_t); FN.append(FN_t)
+        for i in range(len(thresholds)):
+            p = TP[i] / (TP[i] + FP[i] + 1e-7)
+            r = TP[i] / (TP[i] + FN[i] + 1e-7)
+            prc = p; rec = r
+            f1_i = 2 * (p * r) / (p + r + 1e-7)
+            precision.append(prc); recall.append(rec); f1.append(f1_i)
+            fpr.append(FP[i] / (FP[i] + TN[i] + 1e-7))
+        idx = int(np.argmax(f1))
+        out['point_adjusted'] = {
+            'threshold': float(thresholds[idx]),
+            'precision': float(precision[idx]),
+            'recall': float(recall[idx]),
+            'f1': float(f1[idx]),
+            'pr_auc': float(auc(recall, precision)),
+            'roc_auc': float(auc(fpr, recall)),
+        }
 
-    # === Point Adjusted Evaluation ===
-    pa_scores = {'dataset': [], 'f1': [], 'precision': [], 'recall': [], 'pr_auc': [], 'roc_auc': []}
-    print('##### Point Adjusted Evaluation #####')
-    thresholds = _simulate_thresholds(final_as, opts.thresh_num)
-    final_as_seq = _create_sequences(final_as, opts.seq_length, opts.step)
+        # Point-Wise
+        TP = []; TN = []; FP = []; FN = []
+        precision = []; recall = []; f1 = []; fpr = []
+        for th in thresholds:
+            TP_t = TN_t = FP_t = FN_t = 0
+            for ts in range(len(s)):
+                if y[ts] == 1:
+                    if s[ts] >= th:
+                        TP_t += 1
+                    else:
+                        FN_t += 1
+                else:
+                    if s[ts] >= th:
+                        FP_t += 1
+                    else:
+                        TN_t += 1
+            TP.append(TP_t); TN.append(TN_t); FP.append(FP_t); FN.append(FN_t)
+        for i in range(len(thresholds)):
+            p = TP[i] / (TP[i] + FP[i] + 1e-8)
+            r = TP[i] / (TP[i] + FN[i] + 1e-8)
+            precision.append(p); recall.append(r)
+            f1.append(2 * (p * r) / (p + r + 1e-8))
+            fpr.append(FP[i] / (FP[i] + TN[i] + 1e-8))
+        idx = int(np.argmax(f1))
+        out['point_wise'] = {
+            'threshold': float(thresholds[idx]),
+            'precision': float(precision[idx]),
+            'recall': float(recall[idx]),
+            'f1': float(f1[idx]),
+            'pr_auc': float(auc(recall, precision)),
+            'roc_auc': float(auc(fpr, recall)),
+        }
 
-    labels = _create_sequences(label, opts.seq_length, opts.step)
+        # Released Point-Wise (nest_length)
+        thresholds_rel = thresholds  # reuse same threshold grid
+        s_seq = _create_sequences(s, opts.nest_length, opts.step)
+        y_seq = _create_sequences(y, opts.nest_length, opts.step)
+        TP = []; TN = []; FP = []; FN = []
+        precision = []; recall = []; f1 = []; fpr = []
+        for th in thresholds_rel:
+            TP_t = TN_t = FP_t = FN_t = 0
+            for t in range(len(s_seq)):
+                true_anom = set(np.where(y_seq[t] == 1)[0])
+                pred_anom = set(np.where(s_seq[t] > th)[0])
+                if len(pred_anom) > 0 and len(pred_anom.intersection(true_anom)) > 0:
+                    TP_t += 1
+                elif len(pred_anom) == 0 and len(true_anom) == 0:
+                    TN_t += 1
+                elif len(pred_anom) > 0 and len(true_anom) == 0:
+                    FP_t += 1
+                elif len(pred_anom) == 0 and len(true_anom) > 0:
+                    FN_t += 1
+            TP.append(TP_t); TN.append(TN_t); FP.append(FP_t); FN.append(FN_t)
+        for i in range(len(thresholds_rel)):
+            p = TP[i] / (TP[i] + FP[i] + 1e-7)
+            r = TP[i] / (TP[i] + FN[i] + 1e-7)
+            precision.append(p); recall.append(r)
+            f1.append(2 * (p * r) / (p + r + 1e-7))
+            fpr.append(FP[i] / (FP[i] + TN[i] + 1e-7))
+        idx = int(np.argmax(f1))
+        out['released_point_wise'] = {
+            'threshold': float(thresholds_rel[idx]),
+            'precision': float(precision[idx]),
+            'recall': float(recall[idx]),
+            'f1': float(f1[idx]),
+            'pr_auc': float(auc(recall, precision)),
+            'roc_auc': float(auc(fpr, recall)),
+        }
 
-    TP, TN, FP, FN = [], [], [], []
-    precision, recall, f1, fpr = [], [], [], []
-    for th in tqdm(thresholds): # for each threshold
-        TP_t, TN_t, FP_t, FN_t = 0, 0, 0, 0
-        for t in range(len(final_as_seq)): # for each sequence
+        # TranAD-adjusted
+        auc_val, p_raw, r_raw, f1_raw, p_adj, r_adj, f1_adj, th_adj = get_threshold_tranad(
+            labels=y.astype(int), scores=s, print_or_not=False
+        )
+        out['tranad_adjusted'] = {
+            'threshold': float(th_adj),
+            'precision': float(p_adj),
+            'recall': float(r_adj),
+            'f1': float(f1_adj),
+            'pr_auc': float('nan'),
+            'roc_auc': float(auc_val),
+        }
+        return out, n
 
-            # if any part of the segment has an anomaly, we consider it as anomalous sequence
-            true_anomalies, pred_anomalies = set(np.where(labels[t] == 1)[0]), set(np.where(final_as_seq[t] > th)[0])
+    # Build labels once
+    if opts.dataset == 'PSM':
+        data_dict = load_PSM(seq_length=opts.seq_length, stride=1)
+        labels_full = data_dict['y_test'][0]
+    else:
+        print(f"Dataset {opts.dataset} not implemented yet")
+        return
 
-            if len(pred_anomalies) > 0 and len(pred_anomalies.intersection(true_anomalies)) > 0:
-                # correct prediction (at least partial overlap with true anomalies)
-                TP_t = TP_t + 1
-            elif len(pred_anomalies) == 0 and len(true_anomalies) == 0:
-                # correct rejection, no predicted anomaly on no true labels
-                TN_t = TN_t + 1
-            elif len(pred_anomalies) > 0 and len(true_anomalies) == 0:
-                # false alarm (i.e., predict anomalies on no true labels)
-                FP_t = FP_t + 1
-            elif len(pred_anomalies) == 0 and len(true_anomalies) > 0:
-                # predict no anomaly when there is at least one true anomaly within the seq.
-                FN_t = FN_t + 1
+    # Decide which modes to run
+    wanted_modes = []
+    mode = (opts.mode or 'all').lower()
+    if mode == 'all':
+        wanted_modes = ['time', 'freq', 'fused']
+    else:
+        if mode not in ['time', 'freq', 'fused']:
+            print(f"Unknown mode {mode}, defaulting to fused")
+            wanted_modes = ['fused']
+        else:
+            wanted_modes = [mode]
 
-        TP.append(TP_t)
-        TN.append(TN_t)
-        FP.append(FP_t)
-        FN.append(FN_t)
+    # Prepare output accumulator
+    rows = []
+    for m in wanted_modes:
+        if m == 'time':
+            scores = time_only_as
+        elif m == 'freq':
+            scores = freq_only_as
+        else:
+            scores = final_as
 
-    for i in range(len(thresholds)):
-        precision.append(TP[i] / (TP[i] + FP[i] + 1e-7))
-        recall.append(TP[i] / (TP[i] + FN[i] + 1e-7)) # recall or true positive rate (TPR)
-        fpr.append(FP[i] / (FP[i] + TN[i] + 1e-7))
-        f1.append(2 * (precision[i] * recall[i]) / (precision[i] + recall[i] + 1e-7))
+        res, n_used = evaluate_scores(scores, labels_full)
 
-    highest_th_idx = np.argmax(f1)
-    print(f'Threshold: {thresholds[highest_th_idx]}')
-    print("Precision : {:0.4f}, Recall : {:0.4f}, F-score : {:0.4f} ".format(
-            precision[highest_th_idx], recall[highest_th_idx], f1[highest_th_idx]))
-    print("PR-AUC : {:0.4f}, ROC-AUC : {:0.4f}".format(auc(recall, precision), auc(fpr, recall)))
+        print(f"\n=== Evaluation Mode: {m} (N={n_used}) ===")
+        for k, v in res.items():
+            print(f"-- {k} --")
+            print("Threshold: {:.6f}".format(v['threshold']))
+            print("Precision : {:0.4f}, Recall : {:0.4f}, F1 : {:0.4f}".format(v['precision'], v['recall'], v['f1']))
+            if not (np.isnan(v['pr_auc'])):
+                print("PR-AUC : {:0.4f}".format(v['pr_auc']))
+            print("ROC-AUC : {:0.4f}".format(v['roc_auc']))
 
-    pa_scores['dataset'].append(f'{opts.dataset}_{opts.data_num}')
-    pa_scores['f1'].append(f1[highest_th_idx])
-    pa_scores['precision'].append(precision[highest_th_idx])
-    pa_scores['recall'].append(recall[highest_th_idx])
-    pa_scores['pr_auc'].append(auc(recall, precision))
-    pa_scores['roc_auc'].append(auc(fpr, recall))
-    results = pd.DataFrame(pa_scores)
-    print("Point Adjusted Results:")
-    print(results)
+            rows.append({
+                'dataset': opts.dataset,
+                'data_num': opts.data_num,
+                'mode': m,
+                'method': k,
+                'seq_length': opts.seq_length,
+                'nest_length': opts.nest_length,
+                'step': opts.step,
+                'thresh_num': opts.thresh_num,
+                'threshold': v['threshold'],
+                'precision': v['precision'],
+                'recall': v['recall'],
+                'f1': v['f1'],
+                'pr_auc': v['pr_auc'],
+                'roc_auc': v['roc_auc'],
+                'n_used': n_used,
+            })
 
-    # === Point-Wise Evaluation ===
-    pw_scores = {'dataset': [], 'f1': [], 'precision': [], 'recall': [], 'pr_auc': [], 'roc_auc': []}
-    print('\n##### Point-Wise Evaluation #####')
-    TP, TN, FP, FN = [], [], [], []
-    precision, recall, f1, fpr = [], [], [], []
-    for th in tqdm(thresholds): # for each threshold
-
-        TP_t, TN_t, FP_t, FN_t = 0, 0, 0, 0
-        for ts in range(len(final_as)):
-            if label[ts] == 1:
-                if final_as[ts] >= th:
-                    TP_t = TP_t + 1
-                elif final_as[ts] < th:
-                    FN_t = FN_t + 1
-            elif label[ts] == 0:
-                if final_as[ts] >= th:
-                    FP_t = FP_t + 1
-                elif final_as[ts] < th:
-                    TN_t = TN_t + 1
-
-        TP.append(TP_t)
-        TN.append(TN_t)
-        FP.append(FP_t)
-        FN.append(FN_t)
-
-    for i in range(len(thresholds)):
-        precision.append(TP[i] / (TP[i] + FP[i] + 1e-8))
-        recall.append(TP[i] / (TP[i] + FN[i] + 1e-8)) # recall or true positive rate (TPR)
-        fpr.append(FP[i] / (FP[i] + TN[i] + 1e-8))
-        f1.append(2 * (precision[i] * recall[i]) / (precision[i] + recall[i] + 1e-8))
-
-    highest_th_idx = np.argmax(f1)
-    print(f'Threshold: {thresholds[highest_th_idx]}')
-    print("Precision : {:0.4f}, Recall : {:0.4f}, F-score : {:0.4f} ".format(
-            precision[highest_th_idx], recall[highest_th_idx], f1[highest_th_idx]))
-    print("PR-AUC : {:0.4f}, ROC-AUC : {:0.4f}".format(auc(recall, precision), auc(fpr, recall)))
-
-    pw_scores['dataset'].append(f'{opts.dataset}_{opts.data_num}')
-    pw_scores['f1'].append(f1[highest_th_idx])
-    pw_scores['precision'].append(precision[highest_th_idx])
-    pw_scores['recall'].append(recall[highest_th_idx])
-    pw_scores['pr_auc'].append(auc(recall, precision))
-    pw_scores['roc_auc'].append(auc(fpr, recall))
-    results = pd.DataFrame(pw_scores)
-    print("Point-Wise Results:")
-    print(results)
-
-    # === Released Point-Wise Evaluation (with nest_length) ===
-    print('\n##### Released Point-Wise Evaluation #####')
-    pr_scores = {'dataset': [], 'f1': [], 'precision': [], 'recall': [], 'pr_auc': [], 'roc_auc': []}
-    thresholds = _simulate_thresholds(final_as, opts.thresh_num)
-    final_as_seq = _create_sequences(final_as, opts.nest_length, opts.step)
-    labels = _create_sequences(label, opts.nest_length, opts.step)
-
-    TP, TN, FP, FN = [], [], [], []
-    precision, recall, f1, fpr = [], [], [], []
-    for th in tqdm(thresholds): # for each threshold
-        TP_t, TN_t, FP_t, FN_t = 0, 0, 0, 0
-        for t in range(len(final_as_seq)): # for each sequence
-
-            # if any part of the segment has an anomaly, we consider it as anomalous sequence
-            true_anomalies, pred_anomalies = set(np.where(labels[t] == 1)[0]), set(np.where(final_as_seq[t] > th)[0])
-
-            if len(pred_anomalies) > 0 and len(pred_anomalies.intersection(true_anomalies)) > 0:
-                # correct prediction (at least partial overlap with true anomalies)
-                TP_t = TP_t + 1
-            elif len(pred_anomalies) == 0 and len(true_anomalies) == 0:
-                # correct rejection, no predicted anomaly on no true labels
-                TN_t = TN_t + 1
-            elif len(pred_anomalies) > 0 and len(true_anomalies) == 0:
-                # false alarm (i.e., predict anomalies on no true labels)
-                FP_t = FP_t + 1
-            elif len(pred_anomalies) == 0 and len(true_anomalies) > 0:
-                # predict no anomaly when there is at least one true anomaly within the seq.
-                FN_t = FN_t + 1
-
-        TP.append(TP_t)
-        TN.append(TN_t)
-        FP.append(FP_t)
-        FN.append(FN_t)
-
-    for i in range(len(thresholds)):
-        precision.append(TP[i] / (TP[i] + FP[i] + 1e-7))
-        recall.append(TP[i] / (TP[i] + FN[i] + 1e-7)) # recall or true positive rate (TPR)
-        fpr.append(FP[i] / (FP[i] + TN[i] + 1e-7))
-        f1.append(2 * (precision[i] * recall[i]) / (precision[i] + recall[i] + 1e-7))
-
-    highest_th_idx = np.argmax(f1)
-    print(f'Threshold: {thresholds[highest_th_idx]}')
-    print("Precision : {:0.4f}, Recall : {:0.4f}, F-score : {:0.4f} ".format(
-            precision[highest_th_idx], recall[highest_th_idx], f1[highest_th_idx]))
-    print("PR-AUC : {:0.4f}, ROC-AUC : {:0.4f}".format(auc(recall, precision), auc(fpr, recall)))
-
-    pr_scores['dataset'].append(f'{opts.dataset}_{opts.data_num}')
-    pr_scores['f1'].append(f1[highest_th_idx])
-    pr_scores['precision'].append(precision[highest_th_idx])
-    pr_scores['recall'].append(recall[highest_th_idx])
-    pr_scores['pr_auc'].append(auc(recall, precision))
-    pr_scores['roc_auc'].append(auc(fpr, recall))
-    results = pd.DataFrame(pr_scores)
-    print("Released Point-Wise Results:")
-    print(results)
+    # Optionally save CSV
+    if not opts.no_save_csv:
+        results_dir = Path(opts.results_dir)
+        results_dir.mkdir(parents=True, exist_ok=True)
+        out_path = results_dir / f"{opts.dataset}_{opts.data_num}_results.csv"
+        df_out = pd.DataFrame(rows)
+        # Append if exists, else create
+        if out_path.exists():
+            old = pd.read_csv(out_path)
+            df_out = pd.concat([old, df_out], ignore_index=True)
+        df_out.to_csv(out_path, index=False)
+        print(f"\nSaved consolidated results to: {out_path}")
 
     print("\n=== FL Evaluation Complete ===")
 
@@ -313,6 +481,14 @@ def main():
                         help='Form for NeurIPSTS dataset')
     parser.add_argument('--data_num', type=int, default=0,
                         help='Data number')
+    parser.add_argument('--mode', type=str, default='all',
+                        help='Which scores to evaluate: time|freq|fused|all')
+    parser.add_argument('--results_dir', type=str, default='./eval_results',
+                        help='Directory to save consolidated CSV results')
+    parser.add_argument('--no_save_csv', action='store_true',
+                        help='If set, do not write consolidated CSV')
+    parser.add_argument('--verbose', action='store_true',
+                        help='Print loaded arrays for inspection')
 
     opts = parser.parse_args()
 
