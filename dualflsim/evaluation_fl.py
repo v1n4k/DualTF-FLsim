@@ -24,7 +24,7 @@ project_root = str(Path(__file__).resolve().parents[1])
 if project_root not in sys.path:
     sys.path.append(project_root)
 
-from utils.data_loader import load_PSM, normalization, _create_sequences
+from utils.data_loader import load_PSM, normalization, _create_sequences, load_dataset_by_name
 
 
 # === TranAD-style adjusted prediction utilities (adapted from FedKO/utils/ad_util.py) ===
@@ -131,18 +131,80 @@ def get_threshold_tranad(labels, scores, print_or_not=True):
     )
 
 
-def _simulate_thresholds(rec_errors, n):
-    """Generate threshold values for evaluation (copied from original)."""
-    thresholds, step_size = [], abs(np.max(rec_errors) - np.min(rec_errors)) / n
-    th = np.min(rec_errors)
-    thresholds.append(th)
+def _generate_thresholds(scores, max_n, strategy='quantile'):
+    """Generate an informative, reduced set of thresholds.
 
-    print(f'Threshold Range: ({np.min(rec_errors)}, {np.max(rec_errors)}) with Step Size: {step_size}')
-    for i in range(n):
-        th = th + step_size
-        thresholds.append(th)
+    Strategy:
+      - If unique score count <= max_n: return all unique sorted scores (exact sweep)
+      - Else if strategy == 'quantile': sample max_n quantiles (uniform in [0,1])
+      - Fallback: uniform numeric spacing (legacy behavior)
 
-    return thresholds
+    This reduces redundant thresholds when many repeated scores exist and
+    accelerates evaluation substantially for large T.
+    """
+    scores = np.asarray(scores).ravel()
+    if scores.size == 0:
+        return [0.0]
+
+    unique_scores = np.unique(scores)
+    if unique_scores.size == 1:
+        # All scores identical -> only one meaningful threshold
+        return unique_scores.tolist()
+
+    if unique_scores.size <= max_n:
+        thresholds = unique_scores
+        print(f"[ThresholdGen] Using all {thresholds.size} unique scores (<= max_n={max_n}).")
+    else:
+        if strategy == 'quantile':
+            qs = np.linspace(0.0, 1.0, num=max_n)
+            thresholds = np.quantile(scores, qs, method='linear')
+            thresholds = np.unique(thresholds)
+            print(f"[ThresholdGen] Quantile sampling produced {thresholds.size} thresholds (requested {max_n}).")
+        else:
+            mn, mx = scores.min(), scores.max()
+            step = (mx - mn) / max_n
+            thresholds = mn + step * np.arange(max_n + 1)
+            print(f"[ThresholdGen] Uniform stepping produced {thresholds.size} thresholds (range=({mn},{mx})).")
+
+    return thresholds.tolist()
+
+# === Optimization Notes ===
+# Threshold generation now samples either all unique scores (if <= max_n) or
+# a quantile-based subset. This removes redundant thresholds coming from
+# dense score regions and typically shrinks threshold count dramatically.
+#
+# Point-wise evaluation was refactored from O(T * K) loops (iterating all T
+# points for each of K thresholds) to O(T log T + K log T). We sort scores
+# once (O(T log T)) then for each threshold perform a binary search
+# (np.searchsorted) plus O(1) arithmetic with cumulative positive counts.
+# For large T this yields substantial speedups while producing identical
+# metrics compared to exhaustive looping over the same threshold set.
+
+# (Optional) Legacy point-wise evaluator kept for manual validation.
+# def _legacy_pointwise_metrics(scores, labels, thresholds):
+#     TP = []; TN = []; FP = []; FN = []
+#     precision = []; recall = []; f1 = []; fpr = []
+#     for th in thresholds:
+#         TP_t = TN_t = FP_t = FN_t = 0
+#         for i in range(len(scores)):
+#             if labels[i] == 1:
+#                 if scores[i] >= th:
+#                     TP_t += 1
+#                 else:
+#                     FN_t += 1
+#             else:
+#                 if scores[i] >= th:
+#                     FP_t += 1
+#                 else:
+#                     TN_t += 1
+#         TP.append(TP_t); TN.append(TN_t); FP.append(FP_t); FN.append(FN_t)
+#     for i in range(len(thresholds)):
+#         p = TP[i] / (TP[i] + FP[i] + 1e-8)
+#         r = TP[i] / (TP[i] + FN[i] + 1e-8)
+#         precision.append(p); recall.append(r)
+#         f1.append(2 * (p * r) / (p + r + 1e-8))
+#         fpr.append(FP[i] / (FP[i] + TN[i] + 1e-8))
+#     return precision, recall, f1, fpr
 
 
 def load_evaluation_arrays(dataset="PSM", form=None, data_num=0):
@@ -252,8 +314,9 @@ def total_evaluation(opts):
 
     # Load ground truth labels
     print("Loading ground truth labels...")
-    if opts.dataset == 'PSM':
-        data_dict = load_PSM(seq_length=opts.seq_length, stride=1)
+    if opts.dataset in ('PSM','SMD','SMAP','MSL'):
+        # Generic dispatcher
+        data_dict = load_dataset_by_name(opts.dataset, seq_length=opts.seq_length, stride=1)
         label = data_dict['y_test'][0]  # Get labels for data_num=0
     else:
         print(f"Dataset {opts.dataset} not implemented yet")
@@ -268,7 +331,7 @@ def total_evaluation(opts):
         y = labels_1d[:n]
 
         # Point Adjusted (seq_length)
-        thresholds = _simulate_thresholds(s, opts.thresh_num)
+        thresholds = _generate_thresholds(s, opts.thresh_num, strategy='quantile')
         s_seq = _create_sequences(s, opts.seq_length, opts.step)
         y_seq = _create_sequences(y, opts.seq_length, opts.step)
         TP, TN, FP, FN = [], [], [], []
@@ -304,37 +367,48 @@ def total_evaluation(opts):
             'roc_auc': float(auc(fpr, recall)),
         }
 
-        # Point-Wise
-        TP = []; TN = []; FP = []; FN = []
+        # Point-Wise (optimized cumulative method)
+        # Sort scores ascending for binary search; precompute cumulative positives
+        order_asc = np.argsort(s)
+        scores_asc = s[order_asc]
+        labels_asc = y[order_asc].astype(int)
+        cum_pos = np.cumsum(labels_asc)
+        total_pos = int(cum_pos[-1])
+        total = len(s)
+        total_neg = total - total_pos
+
         precision = []; recall = []; f1 = []; fpr = []
+        # We iterate over threshold list (already reduced). For each threshold t, predicted positives are indices with score >= t.
         for th in thresholds:
-            TP_t = TN_t = FP_t = FN_t = 0
-            for ts in range(len(s)):
-                if y[ts] == 1:
-                    if s[ts] >= th:
-                        TP_t += 1
-                    else:
-                        FN_t += 1
-                else:
-                    if s[ts] >= th:
-                        FP_t += 1
-                    else:
-                        TN_t += 1
-            TP.append(TP_t); TN.append(TN_t); FP.append(FP_t); FN.append(FN_t)
-        for i in range(len(thresholds)):
-            p = TP[i] / (TP[i] + FP[i] + 1e-8)
-            r = TP[i] / (TP[i] + FN[i] + 1e-8)
+            # first index where score >= th
+            idx_left = np.searchsorted(scores_asc, th, side='left')
+            # predicted positives count
+            pred_pos = total - idx_left
+            if pred_pos == 0:
+                TP_t = 0
+                FP_t = 0
+            else:
+                # positives among predicted positives = total_pos - positives before idx_left
+                pos_before = cum_pos[idx_left - 1] if idx_left > 0 else 0
+                TP_t = total_pos - pos_before
+                FP_t = pred_pos - TP_t
+            FN_t = total_pos - TP_t
+            TN_t = total_neg - FP_t
+            p = TP_t / (TP_t + FP_t + 1e-8)
+            r = TP_t / (TP_t + FN_t + 1e-8)
             precision.append(p); recall.append(r)
             f1.append(2 * (p * r) / (p + r + 1e-8))
-            fpr.append(FP[i] / (FP[i] + TN[i] + 1e-8))
+            fpr.append(FP_t / (FP_t + TN_t + 1e-8))
         idx = int(np.argmax(f1))
+        pr_auc_val = float(auc(recall, precision)) if len(precision) > 1 else float('nan')
+        roc_auc_val = float(auc(fpr, recall)) if len(fpr) > 1 else float('nan')
         out['point_wise'] = {
             'threshold': float(thresholds[idx]),
             'precision': float(precision[idx]),
             'recall': float(recall[idx]),
             'f1': float(f1[idx]),
-            'pr_auc': float(auc(recall, precision)),
-            'roc_auc': float(auc(fpr, recall)),
+            'pr_auc': pr_auc_val,
+            'roc_auc': roc_auc_val,
         }
 
         # Released Point-Wise (nest_length)
@@ -387,10 +461,14 @@ def total_evaluation(opts):
         }
         return out, n
 
-    # Build labels once
-    if opts.dataset == 'PSM':
-        data_dict = load_PSM(seq_length=opts.seq_length, stride=1)
-        labels_full = data_dict['y_test'][0]
+    # Build labels once (use raw 1D label sequence, not windowed y_test which is 3D)
+    if opts.dataset in ('PSM','SMD','SMAP','MSL'):
+        data_dict = load_dataset_by_name(opts.dataset, seq_length=opts.seq_length, stride=1)
+        labels_full = np.asarray(data_dict['label_seq'][0]).astype(int)
+        if labels_full.ndim != 1:
+            # Safety flatten
+            labels_full = labels_full.reshape(-1)
+        print(f"[DEBUG] Loaded label_seq length: {len(labels_full)} (ndim={labels_full.ndim})")
     else:
         print(f"Dataset {opts.dataset} not implemented yet")
         return

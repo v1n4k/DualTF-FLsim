@@ -22,6 +22,10 @@ from dualflsim.task import (
 )
 import numpy as np
 import io
+import json
+
+# Centralized dataset cache utilities
+from utils.dataset_cache import build_central_cache, load_cache
 
 # Import array generation functionality
 from utils.array_generator import generate_evaluation_arrays
@@ -61,7 +65,7 @@ def aggregate_metrics(metrics: List[Tuple[int, Metrics]]) -> Metrics:
 
 
 class SaveResultsStrategy(FedProx):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, cfg_ref: Optional[dict] = None, **kwargs):
         super().__init__(*args, **kwargs)
         # Clear the file at the beginning of the simulation
         with open("simulation_summary.txt", "w") as f:
@@ -69,6 +73,7 @@ class SaveResultsStrategy(FedProx):
             f.write("="*40 + "\n\n")
         # Track latest aggregated parameters for post-training array generation
         self.latest_parameters: Optional[fl.common.Parameters] = None
+        self._wb_cfg = (cfg_ref or {}).get("wandb", {}) if isinstance(cfg_ref, dict) else {}
 
     # When using a server-side evaluate_fn, aggregate_evaluate is not called.
     # Override evaluate to always persist results regardless of evaluation mode.
@@ -116,29 +121,108 @@ class SaveResultsStrategy(FedProx):
         results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes]],
         failures: List[BaseException],
     ) -> Tuple[fl.common.Parameters, Dict[str, fl.common.Scalar]]:
-        # Let FedProx perform the standard FedAvg + proximal updates
+        round_start = time.time()
         aggregated_parameters, aggregated_metrics = super().aggregate_fit(server_round, results, failures)
-        # Record latest parameters for downstream post-training generation
         try:
             if aggregated_parameters is not None:
                 self.latest_parameters = aggregated_parameters
         except Exception:
             pass
-        # Aggregate client-side train_loss if provided and log via wandb
         try:
             total_examples = 0
             sum_loss = 0.0
-            for _, fr in results:
+            client_losses = []
+            client_recon_time = []
+            client_recon_freq = []
+            # Step-level stats collectors (we aggregate means across clients)
+            step_time_means = []
+            step_freq_means = []
+            client_times = []
+            client_peak_mem = []
+            wb_cfg = self._wb_cfg
+            max_logged = int(wb_cfg.get("max_logged_clients", 32))
+            per_client = bool(wb_cfg.get("log_per_client", True))
+            per_client_logs = {}
+            for cp, fr in results:
+                cid = getattr(cp, "cid", None)
                 m = getattr(fr, "metrics", {}) or {}
+                n = int(getattr(fr, "num_examples", 0))
                 if "train_loss" in m and isinstance(m["train_loss"], (int, float)):
-                    n = int(getattr(fr, "num_examples", 0))
                     total_examples += n
                     sum_loss += float(m["train_loss"]) * n
+                    if len(client_losses) < max_logged:
+                        client_losses.append(float(m["train_loss"]))
+                        if per_client and cid is not None:
+                            per_client_logs[f"client/{cid}/loss"] = float(m["train_loss"])
+                if "recon_time" in m and isinstance(m["recon_time"], (int, float)) and len(client_recon_time) < max_logged:
+                    client_recon_time.append(float(m["recon_time"]))
+                    if per_client and cid is not None:
+                        per_client_logs[f"client/{cid}/recon_time"] = float(m["recon_time"])
+                if "recon_freq" in m and isinstance(m["recon_freq"], (int, float)) and len(client_recon_freq) < max_logged:
+                    client_recon_freq.append(float(m["recon_freq"]))
+                    if per_client and cid is not None:
+                        per_client_logs[f"client/{cid}/recon_freq"] = float(m["recon_freq"])
+                # Step-level stats (flattened from client metrics)
+                if "recon_time_step/mean" in m and len(step_time_means) < max_logged:
+                    try:
+                        step_time_means.append(float(m["recon_time_step/mean"]))
+                        if per_client and cid is not None:
+                            per_client_logs[f"client/{cid}/recon_time_step_mean"] = float(m["recon_time_step/mean"])
+                            per_client_logs[f"client/{cid}/recon_time_step_last"] = float(m.get("recon_time_step/last", 0.0))
+                    except Exception:
+                        pass
+                if "recon_freq_step/mean" in m and len(step_freq_means) < max_logged:
+                    try:
+                        step_freq_means.append(float(m["recon_freq_step/mean"]))
+                        if per_client and cid is not None:
+                            per_client_logs[f"client/{cid}/recon_freq_step_mean"] = float(m["recon_freq_step/mean"])
+                            per_client_logs[f"client/{cid}/recon_freq_step_last"] = float(m.get("recon_freq_step/last", 0.0))
+                    except Exception:
+                        pass
+                if "train_time_s" in m and isinstance(m["train_time_s"], (int, float)) and len(client_times) < max_logged:
+                    client_times.append(float(m["train_time_s"]))
+                    if per_client and cid is not None:
+                        per_client_logs[f"client/{cid}/time_s"] = float(m["train_time_s"])
+                if "train_peak_mem_bytes" in m and isinstance(m["train_peak_mem_bytes"], (int, float)) and len(client_peak_mem) < max_logged:
+                    client_peak_mem.append(float(m["train_peak_mem_bytes"]))
+                    if per_client and cid is not None:
+                        per_client_logs[f"client/{cid}/peak_mem_mb"] = float(m["train_peak_mem_bytes"]) / 1e6
             if total_examples > 0:
                 avg_loss = sum_loss / float(total_examples)
                 if isinstance(aggregated_metrics, dict):
                     aggregated_metrics["train_loss"] = float(avg_loss)
-                log_metrics({"train/avg_loss": float(avg_loss), "train/clients_used": float(len(results))}, step=server_round)
+                log_dict = {"train/avg_loss": float(avg_loss), "train/clients_used": float(len(results))}
+                if client_losses:
+                    log_dict["clients/loss_mean"] = float(np.mean(client_losses))
+                    log_dict["clients/loss_std"] = float(np.std(client_losses))
+                if client_recon_time:
+                    log_dict["clients/recon_time_mean"] = float(np.mean(client_recon_time))
+                    log_dict["clients/recon_time_std"] = float(np.std(client_recon_time))
+                if client_recon_freq:
+                    log_dict["clients/recon_freq_mean"] = float(np.mean(client_recon_freq))
+                    log_dict["clients/recon_freq_std"] = float(np.std(client_recon_freq))
+                if step_time_means:
+                    log_dict["clients/recon_time_step_mean_mean"] = float(np.mean(step_time_means))
+                    log_dict["clients/recon_time_step_mean_std"] = float(np.std(step_time_means))
+                if step_freq_means:
+                    log_dict["clients/recon_freq_step_mean_mean"] = float(np.mean(step_freq_means))
+                    log_dict["clients/recon_freq_step_mean_std"] = float(np.std(step_freq_means))
+                if client_times:
+                    log_dict["clients/time_mean_s"] = float(np.mean(client_times))
+                    log_dict["clients/time_std_s"] = float(np.std(client_times))
+                if client_peak_mem:
+                    log_dict["clients/peak_mem_mean_mb"] = float(np.mean(client_peak_mem) / 1e6)
+                    log_dict["clients/peak_mem_max_mb"] = float(np.max(client_peak_mem) / 1e6)
+                if bool(wb_cfg.get("log_round_timing", True)):
+                    log_dict["round/duration_s"] = float(time.time() - round_start)
+                if bool(wb_cfg.get("log_gpu_memory", True)) and torch.cuda.is_available():
+                    try:
+                        log_dict["server/gpu_mem_alloc_mb"] = float(torch.cuda.memory_allocated() / 1e6)
+                    except Exception:
+                        pass
+                # Merge per-client logs (already capped)
+                log_dict.update(per_client_logs)
+                log_metrics(log_dict, step=server_round)
         except Exception:
             pass
         return aggregated_parameters, aggregated_metrics
@@ -151,6 +235,7 @@ def main():
     cfg = load_config(_get_cfg_path_from_env_or_arg())
     # Optional experiment tracking
     maybe_init_wandb(cfg)
+    SIM_START_TIME = time.time()
 
     # Unpack commonly used sections
     global TRAINING_CFG
@@ -165,14 +250,82 @@ def main():
     EVAL_CFG = cfg.get("evaluation", {})
     POST_CFG = cfg.get("post_training", {})
 
-    # Initialize Ray from config
+    # Initialize Ray from config (auto-adjust GPU count to what's actually visible)
+    requested_gpus_cfg = float(RAY_CFG.get("num_gpus", 4))
+    # Derive visible GPU count respecting CUDA_VISIBLE_DEVICES if set
+    cuda_vis = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_vis is not None and cuda_vis.strip() != "":
+        visible_gpu_count = len([d for d in cuda_vis.split(",") if d.strip() != ""])
+    else:
+        try:
+            visible_gpu_count = torch.cuda.device_count()
+        except Exception:
+            visible_gpu_count = 0
+    if requested_gpus_cfg > visible_gpu_count:
+        print(f"[Ray Init] Requested {requested_gpus_cfg} GPUs but only {visible_gpu_count} visible. Down-scaling.")
+        requested_gpus_cfg = float(visible_gpu_count)
     ray.init(
         num_cpus=int(RAY_CFG.get("num_cpus", 32)),
-        num_gpus=float(RAY_CFG.get("num_gpus", 4)),
+        num_gpus=requested_gpus_cfg,
         ignore_reinit_error=bool(RAY_CFG.get("ignore_reinit_error", True)),
     )
     print("Ray initialized.")
     print(f"Ray resources: {ray.available_resources()}")
+
+    # Determine if we are in SMD by_machine minimal server mode
+    smd_by_machine = (
+        str(DATA_CFG.get("dataset", "")).upper() == 'SMD' and
+        str(DATA_CFG.get("partition_mode", "dirichlet")).lower() == 'by_machine'
+    )
+
+    # === Centralized Dataset Cache Build (Driver) ===
+    if bool(DATA_CFG.get("centralized_cache", False)) and not smd_by_machine:
+        cache_dir = str(DATA_CFG.get("cache_dir", ".cache/dataset"))
+        os.makedirs(cache_dir, exist_ok=True)
+        dataset_name = str(DATA_CFG.get("dataset", "PSM"))
+        seq_length_cfg = int(DATA_CFG.get("seq_length", 50))
+        stride_cfg = int(DATA_CFG.get("step", 1))
+        meta_path = os.path.join(cache_dir, "cache_meta.json")
+        if not os.path.exists(meta_path):
+            print(f"[Server] Building centralized cache at {cache_dir} for dataset={dataset_name} seq_length={seq_length_cfg} stride={stride_cfg}...")
+            meta = build_central_cache(dataset_name, seq_length_cfg, stride_cfg, cache_dir)
+            print(f"[Server] Cache built: train_shape={meta['train_shape']} test_shape={meta['test_shape']}")
+        else:
+            meta = load_cache(cache_dir)
+            print(f"[Server] Reusing existing cache at {cache_dir}: train_shape={meta['train_shape']} test_shape={meta['test_shape']}")
+
+        # Build / reuse partition indices file
+        part_seed = int(DATA_CFG.get("partition_seed", 42))
+        dirichlet_alpha = float(DATA_CFG.get("dirichlet_alpha", 0.5))
+        num_clients_total = int(SIM_CFG.get('num_clients', 24))
+        idx_path = os.path.join(cache_dir, "partitions.npy")
+        if not os.path.exists(idx_path):
+            print(f"[Server] Creating Dirichlet (alpha={dirichlet_alpha}) quantity partitions with seed={part_seed} for {num_clients_total} clients...")
+            rng = np.random.default_rng(part_seed)
+            N_train = int(meta['train_shape'][0])
+            proportions = rng.dirichlet(np.repeat(dirichlet_alpha, num_clients_total))
+            counts = np.round(proportions * N_train).astype(int)
+            counts[-1] = N_train - counts[:-1].sum()
+            indices = np.arange(N_train)
+            rng.shuffle(indices)
+            ptr = 0
+            client_indices = []
+            for c in counts:
+                client_indices.append(indices[ptr:ptr + c])
+                ptr += c
+            np.save(idx_path, np.array(client_indices, dtype=object))
+            print(f"[Server] Saved partition indices: {idx_path}")
+        else:
+            print(f"[Server] Using existing partition indices at {idx_path}")
+
+        # Export environment variables so client_fn/load_data can discover cache
+        os.environ['DUALFLSIM_CACHE_DIR'] = cache_dir
+        os.environ['DUALFLSIM_PARTITIONS_FILE'] = idx_path
+        os.environ['DUALFLSIM_CACHE_ENABLED'] = '1'
+    else:
+        os.environ.pop('DUALFLSIM_CACHE_DIR', None)
+        os.environ.pop('DUALFLSIM_PARTITIONS_FILE', None)
+        os.environ.pop('DUALFLSIM_CACHE_ENABLED', None)
 
     # 2. Define the client resources to 4cpus + 1gpu
     # Use all 4 GPUs for clients during training for maximum parallelism
@@ -180,6 +333,14 @@ def main():
         "num_cpus": int(RES_CFG.get("num_cpus", 4)),
         "num_gpus": float(RES_CFG.get("num_gpus", 1)),
     }
+    # Warn if per-client GPU request exceeds available logical GPUs (will serialize clients)
+    if client_resources["num_gpus"] > 0 and requested_gpus_cfg > 0:
+        max_concurrent = int(requested_gpus_cfg // client_resources["num_gpus"]) if client_resources["num_gpus"] > 0 else 0
+        if max_concurrent == 0:
+            print(f"[Resource Warn] Each client requests {client_resources['num_gpus']} GPU but 0 available. Forcing CPU fallback.")
+            client_resources["num_gpus"] = 0.0
+        else:
+            print(f"[Resource Info] Up to {max_concurrent} clients can run concurrently on {int(requested_gpus_cfg)} visible GPUs.")
 
     # 3. Define the strategy
     # Define model configurations based on the original project's defaults
@@ -211,15 +372,19 @@ def main():
     # Parameter-only templates for SCAFFOLD control variates (exclude buffers)
     param_templates = [p.detach().cpu().numpy() for p in temp_model.parameters()]
 
-    # Preload centralized test dataloaders once to avoid rebuilding/grandwindow every round
-    print("[Server] Preloading centralized test dataloaders...")
-    testloader_time_global, testloader_freq_global = load_centralized_test_data(
-        time_batch_size=int(DATA_CFG.get('time_batch_size', 128)),
-        freq_batch_size=int(DATA_CFG.get('freq_batch_size', 8)),
-        seq_length=int(DATA_CFG.get('seq_length', seq_len)),
-        nest_length=nest_len,
-    )
-    print(f"[Server] Test sizes: time={len(testloader_time_global.dataset)}, freq={len(testloader_freq_global.dataset)}")
+    if not smd_by_machine:
+        # Preload centralized test dataloaders once to avoid rebuilding/grandwindow every round
+        print("[Server] Preloading centralized test dataloaders...")
+        testloader_time_global, testloader_freq_global = load_centralized_test_data(
+            time_batch_size=int(DATA_CFG.get('time_batch_size', 128)),
+            freq_batch_size=int(DATA_CFG.get('freq_batch_size', 8)),
+            seq_length=int(DATA_CFG.get('seq_length', seq_len)),
+            nest_length=nest_len,
+        )
+        print(f"[Server] Test sizes: time={len(testloader_time_global.dataset)}, freq={len(testloader_freq_global.dataset)}")
+    else:
+        testloader_time_global = testloader_freq_global = None
+        print("[Server] SMD by_machine mode: skipping server test preload and cache build.")
 
     # ---------- SCAFFOLD helpers ----------
     def pack_ndarrays_to_bytes(arrs: List[np.ndarray]) -> bytes:
@@ -300,18 +465,73 @@ def main():
 
             # Aggregate and log training loss to wandb if available
             try:
+                wb_cfg = self._wb_cfg if hasattr(self, '_wb_cfg') else {}
+                per_client = bool(wb_cfg.get("log_per_client", True))
+                max_logged = int(wb_cfg.get("max_logged_clients", 32))
                 total_examples = 0
                 sum_loss = 0.0
-                for _, fr in filtered_results:
-                    m = getattr(fr, "metrics", {}) or {}
-                    if "train_loss" in m and isinstance(m["train_loss"], (int, float)):
-                        n = int(getattr(fr, "num_examples", 0))
+                client_losses = []
+                client_recon_time = []
+                client_recon_freq = []
+                step_time_means = []
+                step_freq_means = []
+                per_client_logs = {}
+                for cp, fr in filtered_results:
+                    cid = getattr(cp, 'cid', None)
+                    m = getattr(fr, 'metrics', {}) or {}
+                    n = int(getattr(fr, 'num_examples', 0))
+                    if 'train_loss' in m and isinstance(m['train_loss'], (int, float)):
                         total_examples += n
-                        sum_loss += float(m["train_loss"]) * n
+                        sum_loss += float(m['train_loss']) * n
+                        if len(client_losses) < max_logged:
+                            client_losses.append(float(m['train_loss']))
+                            if per_client and cid is not None:
+                                per_client_logs[f'client/{cid}/loss'] = float(m['train_loss'])
+                    if 'recon_time' in m and isinstance(m['recon_time'], (int, float)) and len(client_recon_time) < max_logged:
+                        client_recon_time.append(float(m['recon_time']))
+                        if per_client and cid is not None:
+                            per_client_logs[f'client/{cid}/recon_time'] = float(m['recon_time'])
+                    if 'recon_freq' in m and isinstance(m['recon_freq'], (int, float)) and len(client_recon_freq) < max_logged:
+                        client_recon_freq.append(float(m['recon_freq']))
+                        if per_client and cid is not None:
+                            per_client_logs[f'client/{cid}/recon_freq'] = float(m['recon_freq'])
+                    if 'recon_time_step/mean' in m and len(step_time_means) < max_logged:
+                        try:
+                            step_time_means.append(float(m['recon_time_step/mean']))
+                            if per_client and cid is not None:
+                                per_client_logs[f'client/{cid}/recon_time_step_mean'] = float(m['recon_time_step/mean'])
+                                per_client_logs[f'client/{cid}/recon_time_step_last'] = float(m.get('recon_time_step/last', 0.0))
+                        except Exception:
+                            pass
+                    if 'recon_freq_step/mean' in m and len(step_freq_means) < max_logged:
+                        try:
+                            step_freq_means.append(float(m['recon_freq_step/mean']))
+                            if per_client and cid is not None:
+                                per_client_logs[f'client/{cid}/recon_freq_step_mean'] = float(m['recon_freq_step/mean'])
+                                per_client_logs[f'client/{cid}/recon_freq_step_last'] = float(m.get('recon_freq_step/last', 0.0))
+                        except Exception:
+                            pass
                 if total_examples > 0:
                     avg_loss = sum_loss / float(total_examples)
-                    aggregated_metrics["train_loss"] = float(avg_loss)
-                    log_metrics({"train/avg_loss": float(avg_loss), "train/clients_used": float(len(filtered_results))}, step=server_round)
+                    aggregated_metrics['train_loss'] = float(avg_loss)
+                    log_dict = {'train/avg_loss': float(avg_loss), 'train/clients_used': float(len(filtered_results))}
+                    if client_losses:
+                        log_dict['clients/loss_mean'] = float(np.mean(client_losses))
+                        log_dict['clients/loss_std'] = float(np.std(client_losses))
+                    if client_recon_time:
+                        log_dict['clients/recon_time_mean'] = float(np.mean(client_recon_time))
+                        log_dict['clients/recon_time_std'] = float(np.std(client_recon_time))
+                    if client_recon_freq:
+                        log_dict['clients/recon_freq_mean'] = float(np.mean(client_recon_freq))
+                        log_dict['clients/recon_freq_std'] = float(np.std(client_recon_freq))
+                    if step_time_means:
+                        log_dict['clients/recon_time_step_mean_mean'] = float(np.mean(step_time_means))
+                        log_dict['clients/recon_time_step_mean_std'] = float(np.std(step_time_means))
+                    if step_freq_means:
+                        log_dict['clients/recon_freq_step_mean_mean'] = float(np.mean(step_freq_means))
+                        log_dict['clients/recon_freq_step_mean_std'] = float(np.std(step_freq_means))
+                    log_dict.update(per_client_logs)
+                    log_metrics(log_dict, step=server_round)
             except Exception:
                 pass
 
@@ -443,6 +663,7 @@ def main():
             evaluate_metrics_aggregation_fn=aggregate_metrics,
             proximal_mu=float(TRAINING_CFG.get('proximal_mu', 0.0)),
             evaluate_fn=None if not bool(EVAL_CFG.get('enabled', False)) else server_evaluate_fn,
+            cfg_ref=cfg,
         )
     else:
         print("[Server] Using SCAFFOLD strategy")
@@ -458,6 +679,7 @@ def main():
             proximal_mu=0.0,
             # Keep server evaluation controlled by EVAL_CFG.enabled; set evaluate_fn accordingly
             evaluate_fn=None if not bool(EVAL_CFG.get('enabled', False)) else server_evaluate_fn,
+            cfg_ref=cfg,
         )
 
     # 4. Start the simulation using fl.simulation.start_simulation
@@ -467,16 +689,25 @@ def main():
         num_clients=int(SIM_CFG.get('num_clients', 24)),
         client_resources=client_resources,
         config=ServerConfig(num_rounds=total_rounds),
-        # Use all 4 GPUs for training clients
+        # Pass the same (possibly down-scaled) GPU count to Flower's internal Ray init
         ray_init_args={
             "num_cpus": int(RAY_CFG.get('num_cpus', 32)),
-            "num_gpus": float(RAY_CFG.get('num_gpus', 4)),
+            "num_gpus": requested_gpus_cfg,
             "ignore_reinit_error": bool(RAY_CFG.get('ignore_reinit_error', True)),
         },
         strategy=strategy,
     )
 
-    print("Simulation finished.")
+    sim_duration = time.time() - SIM_START_TIME
+    print(f"Simulation finished in {sim_duration:.2f}s.")
+    try:
+        if bool(cfg.get("wandb", {}).get("log_total_sim_time", True)):
+            log_metrics({
+                "simulation/total_time_s": float(sim_duration),
+                "simulation/avg_round_time_s": float(sim_duration / max(1, total_rounds))
+            }, step=total_rounds)
+    except Exception:
+        pass
 
     # === POST-TRAINING ARRAY GENERATION ===
     print("\n=== Starting Post-Training Array Generation ===")
@@ -504,42 +735,98 @@ def main():
     set_weights(final_model, final_params_numpy)
     final_model.to(post_train_device)
 
-    # Generate evaluation arrays using centralized test data
-    if bool(POST_CFG.get('generate_arrays', True)):
-        print("[Post-Training] Generating evaluation arrays...")
+    # If in SMD by_machine mode and arrays requested but loaders missing, optionally build them now
+    build_after = bool(POST_CFG.get('build_server_test_after_training', False))
+    if (testloader_time_global is None or testloader_freq_global is None) and smd_by_machine and build_after:
         try:
-            time_path, freq_path, time_df, freq_df = generate_evaluation_arrays(
-                model=final_model,
-                testloader_time=testloader_time_global,
-                testloader_freq=testloader_freq_global,
-                device=post_train_device,
-                dataset=str(POST_CFG.get('dataset', 'PSM')),
-                form=None,
-                data_num=int(POST_CFG.get('data_num', 0)),
-                seq_length=int(POST_CFG.get('seq_length', seq_len)),
-                nest_length=int(POST_CFG.get('nest_length', nest_len)),
-            )
-
-            print(f"[Post-Training] Arrays saved to:")
-            print(f"  - Time array: {time_path}")
-            print(f"  - Freq array: {freq_path}")
-            print(f"[Post-Training] Array shapes:")
-            print(f"  - Time: {time_df.shape}")
-            print(f"  - Freq: {freq_df.shape}")
-
-            # Optionally log arrays as artifacts
-            try:
-                if os.path.isfile(time_path):
-                    log_artifact(time_path, type_="array")
-                if os.path.isfile(freq_path):
-                    log_artifact(freq_path, type_="array")
-            except Exception:
-                pass
-
+            print("[Post-Training] Building centralized SMD test loaders (deferred mode)...")
+            # Manually assemble full test set by concatenating all machine windows
+            # Reuse load_data logic indirectly not ideal here (it partitions); instead manually read files.
+            smd_root = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'datasets', 'SMD')
+            test_dir = os.path.join(smd_root, 'test')
+            label_dir = os.path.join(smd_root, 'test_label')
+            import pandas as pd
+            test_files = sorted([f for f in os.listdir(test_dir) if os.path.isfile(os.path.join(test_dir, f))])
+            label_files = sorted([f for f in os.listdir(label_dir) if os.path.isfile(os.path.join(label_dir, f))])
+            assert len(test_files) == len(label_files) and len(test_files) > 0, "SMD test/label file count mismatch or empty"
+            seq_length_cfg = int(DATA_CFG.get('seq_length', seq_len))
+            all_test_win = []
+            all_label_win = []
+            for tf, lf in zip(test_files, label_files):
+                test_arr = pd.read_csv(os.path.join(test_dir, tf), header=None).values.astype(np.float32)
+                with open(os.path.join(label_dir, lf), 'r') as f:
+                    labels = np.array([float(l.strip().split(',')[0]) for l in f if l.strip()], dtype=np.float32)
+                if labels.shape[0] != test_arr.shape[0]:
+                    continue  # skip inconsistent file
+                # Window
+                if seq_length_cfg > 0 and test_arr.shape[0] >= seq_length_cfg:
+                    from dualflsim.task import _create_sequences as _mkseq  # reuse helper
+                    test_win = _mkseq(test_arr, seq_length_cfg, 1, False)
+                    label_win = _mkseq(labels, seq_length_cfg, 1)
+                    label_win = np.expand_dims(label_win, axis=-1)
+                    all_test_win.append(test_win)
+                    all_label_win.append(label_win)
+            if all_test_win:
+                x_test_full = np.concatenate(all_test_win, axis=0)
+                y_test_full = np.concatenate(all_label_win, axis=0)
+                # Build time-domain loader
+                from dualflsim.task import GeneralLoader
+                from torch.utils.data import DataLoader
+                test_dataset_time = GeneralLoader(x_test_full, y_test_full)
+                testloader_time_global = DataLoader(dataset=test_dataset_time, batch_size=int(DATA_CFG.get('time_batch_size', 128)), shuffle=False, num_workers=2, pin_memory=True)
+                # Frequency domain grand-window build (reuse existing util)
+                from utils.data_loader import generate_frequency_grandwindow
+                freq_dict = generate_frequency_grandwindow(np.array([]), x_test_full, y_test_full, nest_len, step=1)
+                x_test_freq = freq_dict['grand_test_reshaped']
+                y_test_freq = freq_dict['grand_label_reshaped']
+                test_dataset_freq = GeneralLoader(x_test_freq, y_test_freq)
+                testloader_freq_global = DataLoader(dataset=test_dataset_freq, batch_size=int(DATA_CFG.get('freq_batch_size', 8)), shuffle=False, num_workers=2, pin_memory=True)
+                print(f"[Post-Training] Deferred SMD test loaders built: time={len(testloader_time_global.dataset)}, freq={len(testloader_freq_global.dataset)}")
+            else:
+                print("[Post-Training] No SMD test windows constructed; skipping array generation.")
         except Exception as e:
-            print(f"[Post-Training] Error generating arrays: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[Post-Training] Failed to build deferred SMD test loaders: {e}")
+            import traceback; traceback.print_exc()
+
+    # Generate evaluation arrays using centralized test data (now possibly built)
+    if bool(POST_CFG.get('generate_arrays', True)):
+        if testloader_time_global is None or testloader_freq_global is None:
+            print("[Post-Training] Skipping array generation: no centralized test loaders (by_machine mode or disabled test loading).")
+        else:
+            print("[Post-Training] Generating evaluation arrays...")
+            try:
+                time_path, freq_path, time_df, freq_df = generate_evaluation_arrays(
+                    model=final_model,
+                    testloader_time=testloader_time_global,
+                    testloader_freq=testloader_freq_global,
+                    device=post_train_device,
+                    dataset=str(POST_CFG.get('dataset', 'PSM')),
+                    form=None,
+                    data_num=int(POST_CFG.get('data_num', 0)),
+                    seq_length=int(POST_CFG.get('seq_length', seq_len)),
+                    nest_length=int(POST_CFG.get('nest_length', nest_len)),
+                )
+
+                print(f"[Post-Training] Arrays saved to:")
+                print(f"  - Time array: {time_path}")
+                print(f"  - Freq array: {freq_path}")
+                print(f"[Post-Training] Array shapes:")
+                print(f"  - Time: {time_df.shape}")
+                print(f"  - Freq: {freq_df.shape}")
+
+                # Optionally log arrays as artifacts
+                try:
+                    if os.path.isfile(time_path):
+                        log_artifact(time_path, type_="array")
+                    if os.path.isfile(freq_path):
+                        log_artifact(freq_path, type_="array")
+                except Exception:
+                    pass
+
+            except Exception as e:
+                print(f"[Post-Training] Error generating arrays: {e}")
+                import traceback
+                traceback.print_exc()
 
     # Cleanup post-training resources
     try:

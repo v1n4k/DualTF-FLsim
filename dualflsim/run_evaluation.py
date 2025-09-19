@@ -66,7 +66,7 @@ def main():
     DATA_CFG = cfg.get('data', {})
     POST_CFG = cfg.get('post_training', {})
     # If user didn't pass explicit values, fill from config
-    if args.dataset == 'PSM' and 'dataset' in POST_CFG:
+    if args.dataset.upper() in ('PSM','SMD','SMAP','MSL') and 'dataset' in POST_CFG:
         args.dataset = POST_CFG.get('dataset', args.dataset)
     if args.seq_length == 100 and 'seq_length' in POST_CFG:
         args.seq_length = int(POST_CFG.get('seq_length', args.seq_length))

@@ -1,0 +1,61 @@
+{
+  "os":  "Linux-5.15.0-84-generic-x86_64-with-glibc2.17",
+  "python":  "CPython 3.8.12",
+  "startedAt":  "2025-09-19T06:09:29.300686Z",
+  "program":  "run_simulation.py",
+  "codePath":  "dualflsim/run_simulation.py",
+  "codePathLocal":  "run_simulation.py",
+  "git":  {
+    "remote":  "git@github.com:NhatHuyLe/DualTF-FLSim.git",
+    "commit":  "a4834e3af907370a14aed44be3b9e456a9eaf057"
+  },
+  "email":  "nhle4237@uni.sydney.edu.au",
+  "root":  "/share/home/nhle4237/DualTFFLv2/myprojects/DualFLSim/dualflsim",
+  "host":  "gpu4-119-5",
+  "executable":  "/home/nhle4237/miniconda3/envs/dualtf-env/bin/python",
+  "cpu_count":  16,
+  "cpu_count_logical":  32,
+  "gpu":  "NVIDIA GeForce RTX 4090",
+  "gpu_count":  4,
+  "disk":  {
+    "/":  {
+      "total":  "840777867264",
+      "used":  "502605598720"
+    }
+  },
+  "memory":  {
+    "total":  "540430249984"
+  },
+  "gpu_nvidia":  [
+    {
+      "name":  "NVIDIA GeForce RTX 4090",
+      "memoryTotal":  "25757220864",
+      "cudaCores":  16384,
+      "architecture":  "Ada",
+      "uuid":  "GPU-6141e7bc-5424-1ffc-72c6-8eeb8c5f3b45"
+    },
+    {
+      "name":  "NVIDIA GeForce RTX 4090",
+      "memoryTotal":  "25757220864",
+      "cudaCores":  16384,
+      "architecture":  "Ada",
+      "uuid":  "GPU-23d72acd-9878-ef38-9fbb-42b229e3777b"
+    },
+    {
+      "name":  "NVIDIA GeForce RTX 4090",
+      "memoryTotal":  "25757220864",
+      "cudaCores":  16384,
+      "architecture":  "Ada",
+      "uuid":  "GPU-3ce4d09f-f760-a1d4-bf5a-33c84c4701d2"
+    },
+    {
+      "name":  "NVIDIA GeForce RTX 4090",
+      "memoryTotal":  "25757220864",
+      "cudaCores":  16384,
+      "architecture":  "Ada",
+      "uuid":  "GPU-28c1f48f-57d2-b085-3285-8de97eb6e011"
+    }
+  ],
+  "cudaVersion":  "12.2",
+  "writerId":  "gl64ohcoze72aawmejcopm3tqxp3mly0"
+}

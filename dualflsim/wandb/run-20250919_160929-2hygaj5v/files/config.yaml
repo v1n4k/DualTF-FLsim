@@ -1,0 +1,114 @@
+_wandb:
+    value:
+        cli_version: 0.21.4
+        e:
+            gl64ohcoze72aawmejcopm3tqxp3mly0:
+                codePath: dualflsim/run_simulation.py
+                codePathLocal: run_simulation.py
+                cpu_count: 16
+                cpu_count_logical: 32
+                cudaVersion: "12.2"
+                disk:
+                    /:
+                        total: "840777867264"
+                        used: "502605598720"
+                email: nhle4237@uni.sydney.edu.au
+                executable: /home/nhle4237/miniconda3/envs/dualtf-env/bin/python
+                git:
+                    commit: a4834e3af907370a14aed44be3b9e456a9eaf057
+                    remote: git@github.com:NhatHuyLe/DualTF-FLSim.git
+                gpu: NVIDIA GeForce RTX 4090
+                gpu_count: 4
+                gpu_nvidia:
+                    - architecture: Ada
+                      cudaCores: 16384
+                      memoryTotal: "25757220864"
+                      name: NVIDIA GeForce RTX 4090
+                      uuid: GPU-6141e7bc-5424-1ffc-72c6-8eeb8c5f3b45
+                    - architecture: Ada
+                      cudaCores: 16384
+                      memoryTotal: "25757220864"
+                      name: NVIDIA GeForce RTX 4090
+                      uuid: GPU-23d72acd-9878-ef38-9fbb-42b229e3777b
+                    - architecture: Ada
+                      cudaCores: 16384
+                      memoryTotal: "25757220864"
+                      name: NVIDIA GeForce RTX 4090
+                      uuid: GPU-3ce4d09f-f760-a1d4-bf5a-33c84c4701d2
+                    - architecture: Ada
+                      cudaCores: 16384
+                      memoryTotal: "25757220864"
+                      name: NVIDIA GeForce RTX 4090
+                      uuid: GPU-28c1f48f-57d2-b085-3285-8de97eb6e011
+                host: gpu4-119-5
+                memory:
+                    total: "540430249984"
+                os: Linux-5.15.0-84-generic-x86_64-with-glibc2.17
+                program: run_simulation.py
+                python: CPython 3.8.12
+                root: /share/home/nhle4237/DualTFFLv2/myprojects/DualFLSim/dualflsim
+                startedAt: "2025-09-19T06:09:29.300686Z"
+                writerId: gl64ohcoze72aawmejcopm3tqxp3mly0
+        m: []
+        python_version: 3.8.12
+        t:
+            "1":
+                - 1
+                - 5
+                - 30
+                - 53
+            "2":
+                - 1
+                - 5
+                - 30
+                - 53
+            "3":
+                - 15
+                - 16
+            "4": 3.8.12
+            "5": 0.21.4
+            "12": 0.21.4
+            "13": linux-x86_64
+data:
+    value:
+        cache_dir: .cache/dataset
+        centralized_cache: true
+        client_load_test: false
+        dataset: SMD
+        dirichlet_alpha: 0.5
+        freq_batch_size: 32
+        max_train_windows_per_client: null
+        partition_mode: by_machine
+        partition_seed: 42
+        seq_length: 75
+        step: 1
+        time_batch_size: 64
+model:
+    value:
+        freq:
+            c_out: 38
+            d_model: 512
+            e_layers: 3
+            enc_in: 38
+            n_heads: 4
+            nest_length: 25
+        seq_len: 75
+        time:
+            c_out: 38
+            d_model: 512
+            e_layers: 3
+            enc_in: 38
+            n_heads: 8
+simulation:
+    value:
+        fraction_evaluate: 0
+        fraction_fit: 0.25
+        min_available_clients: 6
+        min_fit_clients: 6
+        num_clients: 28
+        total_rounds: 1
+training:
+    value:
+        local_epochs: 5
+        lr: 0.0001
+        proximal_mu: 0

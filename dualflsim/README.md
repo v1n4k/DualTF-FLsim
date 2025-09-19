@@ -53,6 +53,11 @@ Important consistency rules:
 - For PSM, keep `enc_in` and `c_out` at 25 for both time and freq models
 - `model.freq.nest_length` is used for frequency grand-windows, centralized tests, and the frequency model; it’s passed everywhere from config
 - Client counts: `simulation.min_available_clients` and `simulation.min_fit_clients` must be ≤ `simulation.num_clients`
+ - Dataset-feature alignment (must manually adjust when switching datasets):
+     - PSM / SMAP: `model.time.enc_in = model.time.c_out = model.freq.enc_in = model.freq.c_out = 25`
+     - SMD: use 38 instead of 25
+     - MSL: use 55 instead of 25
+     If you forget to update these when changing `data.dataset`, a shape mismatch will occur at model forward time.
 
 You can change any parameter in the YAML without editing code.
 
@@ -96,7 +101,7 @@ python run_simulation.py /path/to/your.yaml
 1.  **`run_simulation.py`**: This is the main entry point. It initializes Ray, defines the Flower strategy (`FedAvg`), and starts the simulation with 10 clients.
 2.  **`dualflsim/client_app.py`**: Defines the Flower `ClientApp`. It handles loading the model and data for each client and calls the `train` and `test` functions.
 3.  **`dualflsim/task.py`**: Contains the core machine learning logic:
-    -   **`load_data`**: Loads the 'seasonal' dataset and partitions it among the clients. It also generates the frequency-domain data.
+    -   **`load_data`**: Loads the configured dataset (see Dataset Selection section) and partitions it among the clients using a Dirichlet quantity split. It also generates the frequency-domain data via grand-window FFT.
     -   **`train`**: Implements the self-supervised training logic for both the time and frequency models.
     -   **`test`**: Implements the evaluation logic, which calculates anomaly scores, finds the best F1-score via threshold simulation, and returns the final metrics.
 4.  **`dualflsim/model/`**: Contains the PyTorch definitions for the `AnomalyTransformer` and `FrequencyTransformer`.
@@ -144,6 +149,40 @@ What gets logged:
 - Final saved time/freq arrays are uploaded as artifacts when generated
 
 Tracking is a no-op when `wandb.enabled` is false or the package is not installed.
+
+## Dataset Selection and Loader Behavior
+
+Supported datasets (configure via `data.dataset` in `configs/default.yaml`):
+
+| Name  | Source / Format | Loader Behavior | Notes |
+|-------|-----------------|-----------------|-------|
+| PSM   | CSV (train/test/test_label) | MinMax scale train, transform test, 30% validation split from test, sliding windows | 25 features |
+| SMD   | Multiple machine `*.txt` files (train/test/test_label) | Concatenate all files (FedKO style), single scaler, 30% validation from test, sliding windows | 38 features (per line) |
+| SMAP  | NASA SMAP (loaded from combined `SMAP+MSL`) | Per-channel `.npy` sequences + anomaly spans. Channels filtered to SMAP, labels synthesized, sequences concatenated vertically (time) then windowed | Feature dim inferred (e.g. 25) |
+| MSL   | NASA MSL (from combined `SMAP+MSL`) | Same as SMAP but filtering `spacecraft == MSL` | Feature dim inferred (e.g. 25) |
+
+Why “stacking”? FedKO concatenates per-file sequences back-to-back to form a single long multivariate time series before window generation. We mirror that for SMD and NASA (SMAP/MSL) so a single scaler and a uniform partitioning strategy are applied. This preserves rough global distribution statistics but loses explicit channel boundaries (acceptable for self-supervised reconstruction, but you can modify to keep channel segmentation if needed).
+
+Switching datasets:
+
+```yaml
+data:
+    dataset: SMD   # or PSM / SMAP / MSL
+    seq_length: 75
+    step: 1
+```
+
+The frequency model's `nest_length` remains independent (controls inner FFT window) but should be ≤ `seq_length`.
+
+Post-training array generation (`post_training.generate_arrays: true`) will write time/freq arrays tagged with the chosen dataset name.
+
+If standalone `datasets/SMAP/` or `datasets/MSL/` folders are later populated, loaders can be extended; currently empty folders trigger fallback to the combined `SMAP+MSL` directory.
+
+### Validation Strategy
+For datasets without an explicit validation split (SMD, SMAP, MSL), we reserve the first 30% of the scaled test set as a pseudo-validation window for consistency with PSM handling. Adjust this easily inside the respective loader if you prefer a different ratio.
+
+### Extending
+Add a new dataset by implementing `load_<NAME>` in `utils/data_loader.py` returning the same dictionary keys and registering it in `load_dataset_by_name`.
 
 ## Switch strategies: FedProx vs SCAFFOLD
 

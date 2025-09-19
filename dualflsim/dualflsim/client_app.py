@@ -7,6 +7,7 @@ from flwr.client import NumPyClient, ClientApp
 from flwr.common import Context
 import io
 import numpy as np
+import time
 
 from dualflsim.task import (
     FederatedDualTF,
@@ -35,6 +36,8 @@ class FlowerClient(NumPyClient):
         local_epochs = config["local_epochs"]
         proximal_mu = config["proximal_mu"]
         lr = float(config.get("lr", 1e-5))
+        # Load config (ensure available for logging flags)
+        cfg = load_config(os.environ.get("DUALFLSIM_CONFIG"))
         # Decode SCAFFOLD controls if provided
         def unpack_bytes_to_ndarrays(data: bytes):
             buf = io.BytesIO(data)
@@ -51,6 +54,15 @@ class FlowerClient(NumPyClient):
                 control_c = control_ci = None
 
         set_weights(self.net, parameters)
+        start_time = time.time()
+        start_mem = None
+        peak_mem = None
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.reset_peak_memory_stats(self.device)
+                start_mem = torch.cuda.memory_allocated(self.device)
+            except Exception:
+                start_mem = None
         # If local_epochs is 0, return weights unchanged with zero contribution
         if int(local_epochs) == 0:
             # Cleanup to keep VRAM low between rounds
@@ -65,7 +77,8 @@ class FlowerClient(NumPyClient):
         # Capture weights before training for SCAFFOLD delta_ci computation
         w_before = [p.detach().cpu().numpy().copy() for p in self.net.parameters()]
         # Pass both training dataloaders to the train function
-        train_loss, num_steps = train(
+        log_step_stats = bool(cfg.get('training', {}).get('log_step_recon_stats', False))
+        train_loss, num_steps, rec_time, rec_freq, step_stats_time, step_stats_freq = train(
             self.net,
             self.trainloader_time,
             self.trainloader_freq,
@@ -76,7 +89,14 @@ class FlowerClient(NumPyClient):
             k=5.0,
             control_c=control_c,
             control_ci=control_ci,
+            log_step_recon_stats=log_step_stats,
         )
+        duration = time.time() - start_time
+        if torch.cuda.is_available():
+            try:
+                peak_mem = torch.cuda.max_memory_allocated(self.device)
+            except Exception:
+                peak_mem = None
         # Weights after training
         w_after = [p.detach().cpu().numpy().copy() for p in self.net.parameters()]
         # Cleanup: move model to CPU and clear CUDA caches to reduce VRAM residency
@@ -91,7 +111,21 @@ class FlowerClient(NumPyClient):
         # Return the total number of training samples
         num_examples = len(self.trainloader_time.dataset) + len(self.trainloader_freq.dataset)
         # Prepare metrics, include SCAFFOLD delta_ci if available
-        metrics = {"train_loss": float(train_loss)}
+        metrics = {
+            "train_loss": float(train_loss),
+            "train_time_s": float(duration),
+            "recon_time": float(rec_time),
+            "recon_freq": float(rec_freq),
+        }
+        if log_step_stats:
+            # Flatten step stats with prefixes
+            for k, v in step_stats_time.items():
+                metrics[f"recon_time_step/{k}"] = v
+            for k, v in step_stats_freq.items():
+                metrics[f"recon_freq_step/{k}"] = v
+        if peak_mem is not None and start_mem is not None:
+            metrics["train_peak_mem_bytes"] = int(peak_mem)
+            metrics["train_start_mem_bytes"] = int(start_mem)
         if control_c is not None and control_ci is not None and num_steps > 0:
             inv = 1.0 / (float(num_steps) * float(lr))
             alpha = 0.1  # damping

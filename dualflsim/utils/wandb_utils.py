@@ -61,6 +61,22 @@ def log_artifact(path: str, name: Optional[str] = None, type_: str = "artifact")
     _run.log_artifact(art)
 
 
+def log_histogram(name: str, values, step: Optional[int] = None, bins: int = 64) -> None:
+    """Log a histogram (safe no-op if wandb disabled).
+
+    values can be list/tuple/np.ndarray. Bins parameter is advisory; wandb will
+    re-bin if needed. This helper avoids import errors when wandb absent.
+    """
+    if _run is None or not _WANDB_AVAILABLE:
+        return
+    try:
+        import numpy as _np
+        arr = _np.asarray(values).ravel()
+        wandb.log({name: wandb.Histogram(arr, num_bins=bins)}, step=step)
+    except Exception:
+        pass
+
+
 def finish() -> None:
     global _run
     if _run is None or not _WANDB_AVAILABLE:
