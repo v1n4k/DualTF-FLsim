@@ -110,22 +110,11 @@ class FlowerClient(NumPyClient):
         gc.collect()
         # Return the total number of training samples
         num_examples = len(self.trainloader_time.dataset) + len(self.trainloader_freq.dataset)
-        # Prepare metrics, include SCAFFOLD delta_ci if available
+        # Prepare minimal metrics; SCAFFOLD delta_ci kept if present
         metrics = {
-            "train_loss": float(train_loss),
-            "train_time_s": float(duration),
-            "recon_time": float(rec_time),
-            "recon_freq": float(rec_freq),
+            "train_loss": float(train_loss),   # per-client loss this round
+            "train_time_s": float(duration),  # per-client wall time this round
         }
-        if log_step_stats:
-            # Flatten step stats with prefixes
-            for k, v in step_stats_time.items():
-                metrics[f"recon_time_step/{k}"] = v
-            for k, v in step_stats_freq.items():
-                metrics[f"recon_freq_step/{k}"] = v
-        if peak_mem is not None and start_mem is not None:
-            metrics["train_peak_mem_bytes"] = int(peak_mem)
-            metrics["train_start_mem_bytes"] = int(start_mem)
         if control_c is not None and control_ci is not None and num_steps > 0:
             inv = 1.0 / (float(num_steps) * float(lr))
             alpha = 0.1  # damping
@@ -195,11 +184,10 @@ def client_fn(context: Context):
     
     # Load all four dataloaders with smaller batch sizes to reduce GPU memory
     trainloader_time, valloader_time, trainloader_freq, valloader_freq = load_data(
-        partition_id=partition_id, 
+        partition_id=partition_id,
         num_partitions=num_partitions,
         time_batch_size=int(DATA_CFG.get('time_batch_size', 64)),
         freq_batch_size=int(DATA_CFG.get('freq_batch_size', 16)),
-        dirichlet_alpha=float(DATA_CFG.get('dirichlet_alpha', 2.0)),
         seq_length=int(DATA_CFG.get('seq_length', seq_len)),
         nest_length=nest_length,
     )

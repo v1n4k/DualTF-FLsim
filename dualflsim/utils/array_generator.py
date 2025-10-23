@@ -205,7 +205,9 @@ def generate_freq_evaluation_array(model, testloader_freq, device, dataset="PSM"
             series_loss /= len(prior)
 
             # Use exponential of the anomaly score (as in original freq code)
-            anomaly_scores = np.exp(rec_loss.detach().cpu().numpy())
+            rec_loss_np = rec_loss.detach().cpu().numpy()
+            # Guard against overflow when exponentiating large reconstruction losses
+            anomaly_scores = np.exp(np.clip(rec_loss_np, a_min=None, a_max=50.0))
 
             test_scores.append(anomaly_scores)
 

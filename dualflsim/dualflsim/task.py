@@ -26,6 +26,7 @@ if project_root not in sys.path:
 
 # Import the data loading and processing logic from the copied utils
 from utils.data_loader import load_tods, TrainingLoader, GeneralLoader, generate_frequency_grandwindow, _create_sequences, load_dataset_by_name
+from utils.dataset_cache import load_cache
 from utils.config import load_config
 
 
@@ -43,117 +44,82 @@ def load_data(
     time_batch_size: int = 64,
     freq_batch_size: int = 16,
     seq_length: int = 50,
-    dirichlet_alpha: float = 2.0,
     nest_length: Optional[int] = None,
 ):
-    """Load and partition the time-series data.
+    """Load and partition the time-series data per plan."""
 
-    Supports two modes:
-    1. Centralized cache mode (preferred): server pre-builds dataset arrays once and
-       provides cache dir + partition indices via env vars.
-    2. Legacy mode: each client loads full dataset and performs local Dirichlet split.
-    """
     cfg = load_config()
     data_cfg = cfg.get('data', {})
     dataset_name = data_cfg.get('dataset', 'PSM')
-    cache_enabled = bool(int(os.environ.get('DUALFLSIM_CACHE_ENABLED', '0')))
     client_load_test = bool(data_cfg.get('client_load_test', False))
-    partition_mode = str(data_cfg.get('partition_mode', 'dirichlet')).lower()
-    smd_by_machine = (dataset_name.upper() == 'SMD' and partition_mode == 'by_machine')
-    if smd_by_machine:
-        # Per-machine direct loading: each client reads only its machine file.
-        # Directory structure: datasets/SMD/train/*.txt, test/*.txt, test_label/*.txt
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        package_root = os.path.dirname(script_dir)
-        base = os.path.join(package_root, 'datasets', 'SMD')
-        train_dir = os.path.join(base, 'train')
-        test_dir = os.path.join(base, 'test')
-        label_dir = os.path.join(base, 'test_label')
-        train_files = sorted([f for f in os.listdir(train_dir) if os.path.isfile(os.path.join(train_dir, f))])
-        test_files = sorted([f for f in os.listdir(test_dir) if os.path.isfile(os.path.join(test_dir, f))])
-        label_files = sorted([f for f in os.listdir(label_dir) if os.path.isfile(os.path.join(label_dir, f))])
-        if partition_id >= len(train_files):
-            raise IndexError(f"SMD by_machine: partition_id {partition_id} >= number of train files {len(train_files)}")
-        train_fp = os.path.join(train_dir, train_files[partition_id])
-        test_fp = os.path.join(test_dir, test_files[partition_id])
-        label_fp = os.path.join(label_dir, label_files[partition_id])
-        # Load arrays
-        import pandas as pd
-        train_df = pd.read_csv(train_fp, header=None).values.astype(np.float32)
-        test_df = pd.read_csv(test_fp, header=None).values.astype(np.float32)
-        with open(label_fp, 'r') as f:
-            labels = np.array([float(l.strip().split(',')[0]) for l in f if l.strip()], dtype=np.float32)
-        if labels.shape[0] != test_df.shape[0]:
-            raise ValueError(f"Label length {labels.shape[0]} mismatch test length {test_df.shape[0]} for {test_fp}")
-        # Local scaling per machine (isolation assumption)
-        from sklearn.preprocessing import MinMaxScaler
-        scaler = MinMaxScaler(feature_range=(0, 1))
-        train_df = scaler.fit_transform(train_df)
-        test_df = scaler.transform(test_df)
-        # Window
-        if seq_length > 0 and train_df.shape[0] >= seq_length:
-            x_train_partition = _create_sequences(train_df, seq_length, 1, False)
+    partition_mode = str(data_cfg.get('partition_mode', 'sequential')).lower()
+
+    cache_dir = os.environ.get('DUALFLSIM_CACHE_DIR')
+    cache_enabled = os.environ.get('DUALFLSIM_CACHE_ENABLED') == '1'
+    cached_dataset = os.environ.get('DUALFLSIM_DATASET')
+
+    use_cache = (
+        cache_enabled
+        and cache_dir
+        and os.path.isdir(cache_dir)
+        and cached_dataset
+        and cached_dataset.upper() == dataset_name.upper()
+        and partition_mode == 'sequential'
+    )
+
+    if use_cache:
+        train_concat = np.load(os.path.join(cache_dir, 'train_concat.npy'), mmap_mode='r')
+        test_concat = np.load(os.path.join(cache_dir, 'test_concat.npy'), mmap_mode='r')
+        label_concat = np.load(os.path.join(cache_dir, 'label_concat.npy'), mmap_mode='r')
+        slices_path = os.path.join(cache_dir, 'client_slices.npy')
+        if os.path.exists(slices_path):
+            slices = np.load(slices_path)
+            if partition_id >= len(slices):
+                raise IndexError(f"partition_id {partition_id} out of range for cached slices ({len(slices)})")
+            start, stop = map(int, slices[partition_id])
         else:
-            x_train_partition = train_df.reshape(-1, seq_length, train_df.shape[1]) if train_df.shape[0] > 0 else np.empty((0, seq_length, train_df.shape[1]))
-        if client_load_test and test_df.shape[0] >= seq_length:
-            x_test = _create_sequences(test_df, seq_length, 1, False)
-            y_test = np.expand_dims(_create_sequences(labels, seq_length, 1), axis=-1)
-        else:
-            x_test = np.empty((0, seq_length, train_df.shape[1]))
-            y_test = np.empty((0, seq_length, train_df.shape[1]))
-        feature_dim = x_train_partition.shape[-1]
-    elif cache_enabled:
-        cache_dir = os.environ.get('DUALFLSIM_CACHE_DIR')
-        part_file = os.environ.get('DUALFLSIM_PARTITIONS_FILE')
-        if not cache_dir or not part_file:
-            raise RuntimeError("Centralized cache flagged enabled but DUALFLSIM_CACHE_DIR or DUALFLSIM_PARTITIONS_FILE missing.")
-        # Memory-map arrays to avoid loading fully into each process memory
-        x_train_mm = np.load(os.path.join(cache_dir, 'x_train.npy'), mmap_mode='r')
-        if client_load_test:
-            x_test = np.load(os.path.join(cache_dir, 'x_test.npy'))
-            y_test = np.load(os.path.join(cache_dir, 'y_test.npy'))
-        else:
-            # Allocate minimal empty test arrays; server handles global test
-            x_test = np.empty((0, seq_length, x_train_mm.shape[-1]))
-            y_test = np.empty((0, seq_length, x_train_mm.shape[-1]))
-        # Load cached mean/std (produced by build_central_cache); fallback if missing (legacy cache)
-        mean_path = os.path.join(cache_dir, 'train_mean.npy')
-        std_path = os.path.join(cache_dir, 'train_std.npy')
-        try:
-            mean = np.load(mean_path)
-            std = np.load(std_path)
-        except FileNotFoundError:
-            # Backward compatibility: compute and (attempt to) persist
-            mean = np.mean(x_train_mm, axis=0)
-            std = np.std(x_train_mm, axis=0) + 1e-6
-            try:
-                np.save(mean_path, mean)
-                np.save(std_path, std)
-                print(f"[Client {partition_id}] Cached mean/std regenerated and saved.")
-            except Exception:
-                print(f"[Client {partition_id}] Warning: could not save regenerated mean/std to cache.")
-        partitions_obj = np.load(part_file, allow_pickle=True)
-        if partition_id >= len(partitions_obj):
-            raise IndexError(f"partition_id {partition_id} out of range for cached partitions size {len(partitions_obj)}")
-        idx = partitions_obj[partition_id]
-        x_train_partition = x_train_mm[idx]
-        x_train_partition = (x_train_partition - mean) / std
-        if client_load_test and x_test.size > 0:
-            x_test = (x_test - mean) / std
-        feature_dim = x_train_partition.shape[-1]
+            meta = load_cache(cache_dir)
+            lengths = meta.get('train_segment_lengths', [])
+            if partition_id >= len(lengths):
+                raise IndexError(f"partition_id {partition_id} out of range for cached segment lengths ({len(lengths)})")
+            computed = sequential_partition(lengths, num_partitions)
+            start = int((computed[partition_id].start or 0))
+            stop = int((computed[partition_id].stop or 0))
+        train_segment = train_concat[start:stop]
+        test_segment = test_concat
+        label_segment = label_concat
     else:
-        # Legacy: load full dataset
-        data_dict = load_dataset_by_name(dataset_name, seq_length=seq_length, stride=1)
-        x_train_full, x_test, y_test = data_dict['x_train'][0], data_dict['x_test'][0], data_dict['y_test'][0]
-        feature_dim = x_train_full.shape[-1]
-        mean = np.mean(x_train_full, axis=0)
-        std = np.std(x_train_full, axis=0) + 1e-6
-        x_train_full = (x_train_full - mean) / std
-        x_test = (x_test - mean) / std
-        train_partitions = partition_data_dirichlet_quantity(
-            x_train_full, num_partitions, alpha=dirichlet_alpha
-        )
-        x_train_partition = train_partitions[partition_id]
+        data_dict = load_dataset_by_name(dataset_name)
+
+        if dataset_name.upper() == 'SMD' and partition_mode == 'by_machine':
+            if partition_id >= len(data_dict['train_segments']):
+                raise IndexError("partition_id out of range for SMD machines")
+            train_segment = data_dict['train_segments'][partition_id]
+            test_segment = data_dict['test_segments'][partition_id]
+            label_segment = data_dict['label_segments'][partition_id]
+        elif dataset_name.upper() in ['SMAP', 'MSL'] and partition_mode == 'by_machine':
+            if partition_id >= len(data_dict['train_segments']):
+                raise IndexError("partition_id out of range for SMAP/MSL channels")
+            train_segment = data_dict['train_segments'][partition_id]
+            test_segment = data_dict['test_segments'][partition_id]
+            label_segment = data_dict['label_segments'][partition_id]
+        else:
+            lengths = [seg.shape[0] for seg in data_dict['train_segments']]
+            slices = sequential_partition(lengths, num_partitions)
+            concat_train = np.concatenate(data_dict['train_segments'], axis=0)
+            current_slice = slices[partition_id]
+            train_segment = concat_train[current_slice]
+            test_segment = np.concatenate(data_dict['test_segments'], axis=0) if len(data_dict['test_segments']) > 1 else data_dict['test_segments'][0]
+            label_segment = np.concatenate(data_dict['label_segments'], axis=0) if len(data_dict['label_segments']) > 1 else data_dict['label_segments'][0]
+
+    feature_dim = train_segment.shape[1]
+    x_train_partition = _create_sequences(train_segment, seq_length, 1)
+    if client_load_test and test_segment.shape[0] >= seq_length:
+        x_test = _create_sequences(test_segment, seq_length, 1)
+        y_test = _create_sequences(label_segment, seq_length, 1)
+    else:
+        x_test = np.empty((0, seq_length, feature_dim))
+        y_test = np.empty((0, seq_length, feature_dim))
 
     # Validate feature dims vs config (applies in both modes)
     time_cfg = cfg.get('model', {}).get('time', {})
@@ -173,8 +139,7 @@ def load_data(
             f" (current dataset '{dataset_name}' inferred feature_dim={feature_dim}). See README consistency rules."
         )
 
-    mode_note = 'smd_by_machine' if smd_by_machine else ('cache' if cache_enabled else 'legacy')
-    print(f"Client {partition_id}: Loading {len(x_train_partition)} time-domain training samples. mode={mode_note}")
+    print(f"Client {partition_id}: Loading {len(x_train_partition)} time-domain training samples. mode={partition_mode}")
 
     # Create Time-Domain DataLoaders
     train_dataset_time = TrainingLoader(x_train_partition)
@@ -227,8 +192,9 @@ def load_centralized_test_data(
     """Load the centralized (full) test dataset."""
     cfg = load_config()
     dataset_name = cfg.get('data', {}).get('dataset', 'PSM')
-    data_dict = load_dataset_by_name(dataset_name, seq_length=seq_length, stride=1)
-    x_train_sample = data_dict['x_train'][0]
+    data_dict = load_dataset_by_name(dataset_name)
+    sample_segment = data_dict['train_segments'][0] if 'train_segments' in data_dict else data_dict['train_sequences'][0]
+    x_train_sample = _create_sequences(sample_segment, seq_length, 1)
     feature_dim = x_train_sample.shape[-1]
     time_cfg = cfg.get('model', {}).get('time', {})
     freq_cfg = cfg.get('model', {}).get('freq', {})
@@ -239,15 +205,12 @@ def load_centralized_test_data(
         raise ValueError(
             f"Model configuration enc_in/c_out mismatch for dataset '{dataset_name}'. Expected all four to be {feature_dim}, got time={expected_time}, freq={expected_freq}."
         )
-    x_train_full, x_test, y_test = data_dict['x_train'][0], data_dict['x_test'][0], data_dict['y_test'][0]
+    test_concat = np.concatenate(data_dict['test_segments'], axis=0) if len(data_dict['test_segments']) > 1 else data_dict['test_segments'][0]
+    label_concat = np.concatenate(data_dict['label_segments'], axis=0) if len(data_dict['label_segments']) > 1 else data_dict['label_segments'][0]
 
-    # Standardize the test set using the mean/std of the training set
-    mean = np.mean(x_train_full, axis=0)
-    std = np.std(x_train_full, axis=0) + 1e-6
-    x_test = (x_test - mean) / std
-
-    # Create Time-Domain DataLoader
-    test_dataset_time = GeneralLoader(x_test, y_test)
+    time_windows = _create_sequences(test_concat, seq_length, 1)
+    label_windows = _create_sequences(label_concat, seq_length, 1)
+    test_dataset_time = GeneralLoader(time_windows, label_windows)
     testloader_time = DataLoader(dataset=test_dataset_time, batch_size=time_batch_size, shuffle=False, num_workers=2, pin_memory=True, persistent_workers=True)
 
     # Create Frequency-Domain DataLoader
@@ -255,7 +218,7 @@ def load_centralized_test_data(
         cfg = load_config()
         nest_length = int(cfg.get('model', {}).get('freq', {}).get('nest_length', 25))
     # Note: We pass dummy empty arrays for train data as we only need the test set
-    freq_dict = generate_frequency_grandwindow(np.array([]), x_test, y_test, nest_length, step=1)
+    freq_dict = generate_frequency_grandwindow(np.array([]), time_windows, label_windows, nest_length, step=1)
     x_test_freq = freq_dict['grand_test_reshaped']
     y_test_freq = freq_dict['grand_label_reshaped']
 
@@ -948,36 +911,6 @@ def test(
     print(f"Test Results - F1: {f1:.4f}, Precision: {precision:.4f}, Recall: {recall:.4f}, Threshold: {best_th:.6f}, TP: {tp}, FP: {fp}, FN: {fn}")
 
     return loss, {"f1": f1, "precision": precision, "recall": recall, "threshold": best_th, "tp": tp, "fp": fp, "fn": fn}
-
-
-def partition_data_dirichlet_quantity(data, num_partitions, alpha=0.5, seed=42):
-    """Partitions data into different quantities based on a Dirichlet distribution."""
-    np.random.seed(seed)  # Ensure deterministic partitioning across clients
-    num_samples = len(data)
-
-    # Get proportions for data quantity
-    proportions = np.random.dirichlet(np.repeat(alpha, num_partitions))
-
-    # Calculate the number of samples for each partition
-    samples_per_partition = np.round(proportions * num_samples).astype(int)
-
-    # Ensure the sum is correct due to rounding
-    samples_per_partition[-1] = num_samples - np.sum(samples_per_partition[:-1])
-
-    # Shuffle data indices
-    indices = np.arange(num_samples)
-    np.random.shuffle(indices)
-
-    # Create the partitions
-    partitions = []
-    start = 0
-    for num_samples_in_partition in samples_per_partition:
-        end = start + num_samples_in_partition
-        partition_indices = indices[start:end]
-        partitions.append(data[partition_indices])
-        start = end
-
-    return partitions
 
 
 def get_weights(net):

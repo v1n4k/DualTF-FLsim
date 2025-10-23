@@ -1,4 +1,5 @@
 import os
+import copy
 import numpy as np
 import pandas as pd
 import torch
@@ -61,14 +62,51 @@ def torch_fft_transform(seq):
 # Generated training sequences for use in the model.
 def _create_sequences(values, seq_length, stride, historical=False):
     seq = []
+    values = np.asarray(values)
     if historical:
         for i in range(seq_length, len(values) + 1, stride):
             seq.append(values[i-seq_length:i])
     else:
         for i in range(0, len(values) - seq_length + 1, stride):
             seq.append(values[i : i + seq_length])
-   
+
+    if not seq:
+        tail_shape = values.shape[1:] if values.ndim > 1 else ()
+        empty_shape = (0, seq_length) + tail_shape
+        return np.empty(empty_shape, dtype=values.dtype)
+
     return np.stack(seq)
+
+
+def windowize_segments(segments, seq_length, stride, historical=False):
+    """Apply `_create_sequences` to each contiguous segment in `segments`."""
+
+    windowed = []
+    for segment in segments:
+        if seq_length and seq_length > 0 and segment.shape[0] >= seq_length:
+            windowed.append(_create_sequences(segment, seq_length, stride, historical))
+        else:
+            windowed.append(segment)
+    return windowed
+
+
+def sequential_partition(lengths: List[int], num_clients: int) -> List[slice]:
+    """Partition concatenated segments sequentially across `num_clients`."""
+
+    total = sum(lengths)
+    if num_clients <= 0:
+        raise ValueError("num_clients must be positive")
+    base = total // num_clients
+    rem = total % num_clients
+    slices = []
+    cursor = 0
+    for cid in range(num_clients):
+        take = base + (1 if cid < rem else 0)
+        start = cursor
+        end = min(total, start + take)
+        slices.append(slice(start, end))
+        cursor = end
+    return slices
 
 def _count_anomaly_segments(values):
     values = np.where(values == 1)[0]
@@ -268,63 +306,29 @@ def load_tods(form, seq_length=50, stride=1):
     return {'x_train': x_train, 'x_test': x_test, 'y_test': y_test, 'label_seq': label_seq, 'test_seq': test_seq}
 
 
-def load_PSM(seq_length=100, stride=1, historical=False):
+def load_PSM():
     # seq. length: 60:30 (ref. )
     # source: https://github.com/eBay/RANSynCoders
     # interval:  equally-spaced 1 minute apart
     
-    # --- Path Correction ---
-    # The 'datasets' directory is inside the 'dualflsim' package, relative to this script.
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    # Go up one directory from 'utils' to the 'dualflsim' package root
     package_root = os.path.dirname(script_dir)
     path = os.path.join(package_root, 'datasets', 'PSM')
 
-    x_train, x_valid, x_test = [], [], []
-    y_valid, y_test = [], []
-    y_segment_valid, y_segment_test = [], []
-    train_seq, label_seq, test_seq = [], [], []
-    
-    train_df = pd.read_csv(f'{path}/train.csv').iloc[:, 1:].fillna(method="ffill").values
-    test_df = pd.read_csv(f'{path}/test.csv').iloc[:, 1:].fillna(method="ffill").values
-    labels = pd.read_csv(f'{path}/test_label.csv')['label'].values.astype(int)
+    train_df = pd.read_csv(os.path.join(path, 'train.csv')).iloc[:, 1:].fillna(method="ffill").values.astype(np.float32)
+    test_df = pd.read_csv(os.path.join(path, 'test.csv')).iloc[:, 1:].fillna(method="ffill").values.astype(np.float32)
+    labels = pd.read_csv(os.path.join(path, 'test_label.csv'))['label'].values.astype(int)
 
     scaler = MinMaxScaler(feature_range=(0, 1))
-    train_df = scaler.fit_transform(train_df)
-    test_df = scaler.transform(test_df)
+    train_scaled = scaler.fit_transform(train_df)
+    test_scaled = scaler.transform(test_df)
 
-    print(f"[DEBUG in data_loader.py] Shape of test_df after loading: {test_df.shape}")
-
-    valid_idx = int(test_df.shape[0] * 0.3)
-    valid_df = test_df[:valid_idx]
-
-    if seq_length > 0:
-        x_train.append(_create_sequences(train_df, seq_length, stride, historical))
-        x_valid.append(_create_sequences(valid_df, seq_length, stride, historical))
-        
-        x_test.append(_create_sequences(test_df, seq_length, stride, historical))
-        
-        y_test.append(np.expand_dims(_create_sequences(labels, seq_length, stride), axis=-1))
-    else:
-        x_train.append(train_df)
-        x_valid.append(valid_df)
-        x_test.append(test_df)
-        y_test.append(labels)
-    
-    label_seq.append(labels)
-    test_seq.append(test_df)
-    train_seq.append(train_df)
-    
-    valid_labels = labels[:valid_idx]
-    y_segment_valid.append(_count_anomaly_segments(valid_labels)[1])
-    y_segment_test.append(_count_anomaly_segments(label_seq)[1])
-    y_valid.append(valid_labels)
-
-        
-    return {'x_train': x_train, 'x_valid': x_valid, 'x_test': x_test,
-            'label_seq': label_seq, 'test_seq': test_seq, 'train_seq': train_seq,
-            'y_valid': y_valid, 'y_test': y_test,
-            'y_segment_valid': y_segment_valid, 'y_segment_test': y_segment_test}
+    return {
+        'train_segments': [train_scaled],
+        'test_segments': [test_scaled],
+        'label_segments': [labels.reshape(-1, 1)],
+        'scalers': [scaler],
+    }
 
 
 # ===================== Added NASA / SMD loaders (FedKO-style adaptation) ===================== #
@@ -368,12 +372,9 @@ def _concat_files_in_dir(dir_path: str, file_ext: str = None, loader='csv') -> n
     return np.concatenate(arrays, axis=0)
 
 
-def load_SMD(seq_length=100, stride=1, historical=False) -> Dict[str, Any]:
-    """Replicates FedKO style: concatenate all SMD train/test files then window like PSM loader.
+def load_SMD_raw() -> Dict[str, Any]:
+    """Load SMD data as raw scaled segments per machine."""
 
-    Dataset expected at datasets/SMD with subfolders train/, test/, test_label/
-    Each file is numeric CSV/txt; labels are 0/1 per line in matching order.
-    """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     package_root = os.path.dirname(script_dir)
     base = os.path.join(package_root, 'datasets', 'SMD')
@@ -381,73 +382,42 @@ def load_SMD(seq_length=100, stride=1, historical=False) -> Dict[str, Any]:
     test_dir = os.path.join(base, 'test')
     label_dir = os.path.join(base, 'test_label')
 
-    try:
-        train_df = _concat_files_in_dir(train_dir, loader='csv')
-        test_df = _concat_files_in_dir(test_dir, loader='csv')
-    except (FileNotFoundError, RuntimeError) as e:
-        raise RuntimeError(
-            f"Failed loading SMD dataset: {e}\n"
-            f"Expected structure: {base}/train/*.txt, {base}/test/*.txt, {base}/test_label/*.txt"
-        )
+    train_segments = []
+    test_segments = []
+    label_segments = []
+    scalers = []
 
-    # Load labels: each file contains per-line 0/1; we concatenate in same sorted order
+    train_files = sorted(os.listdir(train_dir))
+    test_files = sorted(os.listdir(test_dir))
     label_files = sorted(os.listdir(label_dir))
-    labels_list: List[np.ndarray] = []
-    for lf in label_files:
-        with open(os.path.join(label_dir, lf), 'r') as f:
-            lines = [l.strip().split(',')[0] for l in f if l.strip()]
-            vals = np.array([float(x) for x in lines], dtype=np.float32)
-            labels_list.append(vals)
-    labels = np.concatenate(labels_list, axis=0).astype(int)
 
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    train_df = scaler.fit_transform(train_df)
-    test_df = scaler.transform(test_df)
+    for trf, tef, lbf in zip(train_files, test_files, label_files):
+        train_df = pd.read_csv(os.path.join(train_dir, trf), header=None).values.astype(np.float32)
+        test_df = pd.read_csv(os.path.join(test_dir, tef), header=None).values.astype(np.float32)
+        labels = np.loadtxt(os.path.join(label_dir, lbf), delimiter=',').astype(int)
 
-    x_train, x_valid, x_test = [], [], []
-    y_valid, y_test = [], []
-    y_segment_valid, y_segment_test = [], []
-    train_seq, test_seq, label_seq = [], [], []
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        train_scaled = scaler.fit_transform(train_df)
+        test_scaled = scaler.transform(test_df)
 
-    # For SMD we do not have a separate validation; mimic PSM splitting portion of test for validation (30%)
-    valid_idx = int(test_df.shape[0] * 0.3)
-    valid_df = test_df[:valid_idx]
-    valid_labels = labels[:valid_idx]
+        train_segments.append(train_scaled)
+        test_segments.append(test_scaled)
+        label_segments.append(labels.reshape(-1, 1))
+        scalers.append(scaler)
 
-    if seq_length > 0:
-        x_train.append(_create_sequences(train_df, seq_length, stride, historical))
-        x_valid.append(_create_sequences(valid_df, seq_length, stride, historical))
-        x_test.append(_create_sequences(test_df, seq_length, stride, historical))
-        y_test.append(np.expand_dims(_create_sequences(labels, seq_length, stride), axis=-1))
-    else:
-        x_train.append(train_df)
-        x_valid.append(valid_df)
-        x_test.append(test_df)
-        y_test.append(labels)
-
-    label_seq.append(labels)
-    test_seq.append(test_df)
-    train_seq.append(train_df)
-    y_valid.append(valid_labels)
-    y_segment_valid.append(_count_anomaly_segments(valid_labels)[1])
-    y_segment_test.append(_count_anomaly_segments(label_seq)[1])
-
-    return {'x_train': x_train, 'x_valid': x_valid, 'x_test': x_test,
-            'label_seq': label_seq, 'test_seq': test_seq, 'train_seq': train_seq,
-            'y_valid': y_valid, 'y_test': y_test,
-            'y_segment_valid': y_segment_valid, 'y_segment_test': y_segment_test}
+    return {
+        'train_segments': train_segments,
+        'test_segments': test_segments,
+        'label_segments': label_segments,
+        'scalers': scalers,
+    }
 
 
-def _load_smap_msl_combined(seq_length=100, stride=1, historical=False, dataset_name='SMAP') -> Dict[str, Any]:
-    """Load SMAP or MSL from the combined NASA format (SMAP+MSL) replicating FedKO stacking.
-
-    We have combined folder structure with train/test .npy per channel and a CSV describing anomalies.
-    We'll produce labels by building a binary vector for each channel and concatenating channels of the selected spacecraft.
-    NOTE: This assumes variable length series across channels; we'll concatenate sequentially (stack time) like FedKO.
-    """
+def _load_smap_msl_combined(dataset_name='SMAP') -> Dict[str, Any]:
+    """Load SMAP or MSL channels as raw contiguous segments (FedKO-style)."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     package_root = os.path.dirname(script_dir)
-    base = os.path.join(package_root, 'datasets', 'SMAP+MSL', 'data', 'data')
+    base = os.path.join(package_root, 'datasets', 'SMAP+MSL', 'data')
     train_dir = os.path.join(base, 'train')
     test_dir = os.path.join(base, 'test')
     anomalies_csv = os.path.join(package_root, 'datasets', 'SMAP+MSL', 'labeled_anomalies.csv')
@@ -461,11 +431,11 @@ def _load_smap_msl_combined(seq_length=100, stride=1, historical=False, dataset_
     meta = pd.read_csv(anomalies_csv)
     # Filter spacecraft rows
     filtered = meta[meta['spacecraft'] == dataset_name]
-    channel_to_spans = {}
+    channel_to_spans: Dict[str, List[List[List[int]]]] = {}
     for _, row in filtered.iterrows():
         chan = row['chan_id']
         spans = eval(row['anomaly_sequences']) if isinstance(row['anomaly_sequences'], str) else []
-        channel_to_spans[chan] = spans
+        channel_to_spans.setdefault(chan, []).append(spans)
     if not channel_to_spans:
         raise RuntimeError(
             f"No channels found for spacecraft={dataset_name} in {anomalies_csv}.\n"
@@ -484,59 +454,62 @@ def _load_smap_msl_combined(seq_length=100, stride=1, historical=False, dataset_
     train_arrays = build_channel_arrays(train_dir)
     test_arrays = build_channel_arrays(test_dir)
     # Build labels per channel
-    label_arrays = {}
+    label_arrays: Dict[str, List[np.ndarray]] = {}
     for chan, arr in test_arrays.items():
+        span_sets = channel_to_spans.get(chan)
+        if not span_sets:
+            continue
         length = arr.shape[0]
-        labels = np.zeros(length, dtype=int)
-        for s, e in channel_to_spans.get(chan, []):
-            e = min(e, length-1)
-            labels[s:e+1] = 1
-        label_arrays[chan] = labels
+        label_arrays[chan] = []
+        for spans in span_sets:
+            labels = np.zeros(length, dtype=int)
+            for s, e in spans:
+                e = min(e, length - 1)
+                labels[s:e+1] = 1
+            label_arrays[chan].append(labels)
 
-    # Concatenate channels sequentially along time axis (FedKO style stacking) maintaining feature dimension
-    train_df = np.concatenate(list(train_arrays.values()), axis=0) if train_arrays else np.empty((0,))
-    test_df = np.concatenate(list(test_arrays.values()), axis=0) if test_arrays else np.empty((0,))
-    labels = np.concatenate(list(label_arrays.values()), axis=0) if label_arrays else np.empty((0,), dtype=int)
-    if train_df.ndim == 1:
-        train_df = train_df.reshape(-1, 1)
-    if test_df.ndim == 1:
-        test_df = test_df.reshape(-1, 1)
+    train_segments: List[np.ndarray] = []
+    test_segments: List[np.ndarray] = []
+    label_segments: List[np.ndarray] = []
+    scalers: List[MinMaxScaler] = []
+    channel_names: List[str] = []
 
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    train_df = scaler.fit_transform(train_df)
-    test_df = scaler.transform(test_df)
+    for chan in sorted(train_arrays.keys()):
+        if chan not in test_arrays or chan not in label_arrays:
+            continue
+        train_arr = train_arrays[chan]
+        test_arr = test_arrays[chan]
+        label_list = label_arrays[chan]
 
-    x_train, x_valid, x_test = [], [], []
-    y_valid, y_test = [], []
-    y_segment_valid, y_segment_test = [], []
-    train_seq, test_seq, label_seq = [], [], []
+        if train_arr.ndim == 1:
+            train_arr = train_arr.reshape(-1, 1)
+        if test_arr.ndim == 1:
+            test_arr = test_arr.reshape(-1, 1)
 
-    valid_idx = int(test_df.shape[0] * 0.3)
-    valid_df = test_df[:valid_idx]
-    valid_labels = labels[:valid_idx]
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        train_scaled = scaler.fit_transform(train_arr)
+        test_scaled = scaler.transform(test_arr)
 
-    if seq_length > 0 and test_df.shape[0] >= seq_length:
-        x_train.append(_create_sequences(train_df, seq_length, stride, historical))
-        x_valid.append(_create_sequences(valid_df, seq_length, stride, historical))
-        x_test.append(_create_sequences(test_df, seq_length, stride, historical))
-        y_test.append(np.expand_dims(_create_sequences(labels, seq_length, stride), axis=-1))
-    else:
-        x_train.append(train_df)
-        x_valid.append(valid_df)
-        x_test.append(test_df)
-        y_test.append(labels)
+        for idx, label_arr in enumerate(label_list):
+            chan_name = chan if idx == 0 else f"{chan}#{idx+1}"
+            label_ready = label_arr.reshape(-1, 1)
 
-    label_seq.append(labels)
-    test_seq.append(test_df)
-    train_seq.append(train_df)
-    y_valid.append(valid_labels)
-    y_segment_valid.append(_count_anomaly_segments(valid_labels)[1])
-    y_segment_test.append(_count_anomaly_segments(label_seq)[1])
+            train_segments.append(train_scaled.astype(np.float32))
+            test_segments.append(test_scaled.astype(np.float32))
+            label_segments.append(label_ready.astype(np.int32))
+            scalers.append(copy.deepcopy(scaler))
+            channel_names.append(chan_name)
 
-    return {'x_train': x_train, 'x_valid': x_valid, 'x_test': x_test,
-            'label_seq': label_seq, 'test_seq': test_seq, 'train_seq': train_seq,
-            'y_valid': y_valid, 'y_test': y_test,
-            'y_segment_valid': y_segment_valid, 'y_segment_test': y_segment_test}
+    if not train_segments:
+        raise RuntimeError(f"No overlapping channels found for spacecraft={dataset_name}")
+
+    return {
+        'train_segments': train_segments,
+        'test_segments': test_segments,
+        'label_segments': label_segments,
+        'channel_names': channel_names,
+        'scalers': scalers,
+    }
 
 
 def load_SMAP(seq_length=100, stride=1, historical=False):
@@ -547,7 +520,7 @@ def load_SMAP(seq_length=100, stride=1, historical=False):
     if os.path.isdir(smap_dir) and os.listdir(smap_dir):
         # Placeholder: currently directory empty in workspace; fallback path below will execute.
         pass
-    return _load_smap_msl_combined(seq_length, stride, historical, dataset_name='SMAP')
+    return _load_smap_msl_combined(dataset_name='SMAP')
 
 
 def load_MSL(seq_length=100, stride=1, historical=False):
@@ -557,19 +530,19 @@ def load_MSL(seq_length=100, stride=1, historical=False):
     if os.path.isdir(msl_dir) and os.listdir(msl_dir):
         # Placeholder if raw separated MSL format appears later.
         pass
-    return _load_smap_msl_combined(seq_length, stride, historical, dataset_name='MSL')
+    return _load_smap_msl_combined(dataset_name='MSL')
 
 
-def load_dataset_by_name(name: str, seq_length=100, stride=1, historical=False) -> Dict[str, Any]:
+def load_dataset_by_name(name: str) -> Dict[str, Any]:
     name_upper = name.upper()
     if name_upper == 'PSM':
-        return load_PSM(seq_length, stride, historical)
+        return load_PSM()
     if name_upper == 'SMD':
-        return load_SMD(seq_length, stride, historical)
+        return load_SMD_raw()
     if name_upper == 'SMAP':
-        return load_SMAP(seq_length, stride, historical)
+        return _load_smap_msl_combined(dataset_name='SMAP')
     if name_upper == 'MSL':
-        return load_MSL(seq_length, stride, historical)
+        return _load_smap_msl_combined(dataset_name='MSL')
     raise ValueError(f"Unsupported dataset name: {name}. Available: PSM, SMD, SMAP, MSL")
 
 

@@ -57,7 +57,8 @@ def default_config() -> Dict[str, Any]:
         },
         "data": {
             "dataset": "PSM",
-            "dirichlet_alpha": 2.0,
+            "partition_mode": "sequential",
+            "cache_clients": None,
             "time_batch_size": 64,
             "freq_batch_size": 16,
             "seq_length": 100,

@@ -16,9 +16,7 @@ from dualflsim.task import (
     FederatedDualTF,
     get_weights,
     set_weights,
-    load_data,
     load_centralized_test_data,
-    test,
 )
 import numpy as np
 import io
@@ -54,66 +52,22 @@ def fit_config(server_round: int) -> Dict[str, fl.common.Scalar]:
     }
 
 
-def aggregate_metrics(metrics: List[Tuple[int, Metrics]]) -> Metrics:
-    """Aggregate F1, precision, and recall."""
-    # Calculate weighted average for each metric
-    f1_aggregated = sum([m["f1"] * num_examples for num_examples, m in metrics]) / sum([num_examples for num_examples, _ in metrics])
-    precision_aggregated = sum([m["precision"] * num_examples for num_examples, m in metrics]) / sum([num_examples for num_examples, _ in metrics])
-    recall_aggregated = sum([m["recall"] * num_examples for num_examples, m in metrics]) / sum([num_examples for num_examples, _ in metrics])
-    
-    return {"f1": f1_aggregated, "precision": precision_aggregated, "recall": recall_aggregated}
+"""
+Note: Training rounds have no server-side evaluation. We only train/aggregate,
+then generate time/freq arrays once after training completes.
+"""
 
 
 class SaveResultsStrategy(FedProx):
+    """Minimal FedProx strategy for training + aggregation only.
+    - No server-side evaluation during FL rounds
+    - Track latest_parameters for post-training inference
+    - Log only per-client loss and mean client train time per round
+    """
     def __init__(self, *args, cfg_ref: Optional[dict] = None, **kwargs):
         super().__init__(*args, **kwargs)
-        # Clear the file at the beginning of the simulation
-        with open("simulation_summary.txt", "w") as f:
-            f.write("Federated Learning Simulation Summary\n")
-            f.write("="*40 + "\n\n")
-        # Track latest aggregated parameters for post-training array generation
         self.latest_parameters: Optional[fl.common.Parameters] = None
         self._wb_cfg = (cfg_ref or {}).get("wandb", {}) if isinstance(cfg_ref, dict) else {}
-
-    # When using a server-side evaluate_fn, aggregate_evaluate is not called.
-    # Override evaluate to always persist results regardless of evaluation mode.
-    def evaluate(
-        self,
-        server_round: int,
-        parameters: fl.common.Parameters,
-    ) -> Tuple[float, Dict[str, fl.common.Scalar]]:
-        # Delegate to base class (will call evaluate_fn if provided)
-        result = super().evaluate(server_round, parameters)
-        loss, metrics = result if result is not None else (None, None)
-        if loss is not None and metrics is not None:
-            with open("simulation_summary.txt", "a") as f:
-                f.write(f"Round {server_round}:\n")
-                f.write(f"  Loss: {loss}\n")
-                for metric, value in metrics.items():
-                    f.write(f"    {metric}: {value}\n")
-                f.write("\n")
-        return result
-
-    def aggregate_evaluate(
-        self,
-        server_round: int,
-        results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.EvaluateRes]],
-        failures: List[BaseException],
-    ) -> Tuple[float, Dict[str, fl.common.Scalar]]:
-        """Aggregate evaluation results and save them to a file."""
-        # Call the base class method to perform the actual aggregation
-        aggregated_loss, aggregated_metrics = super().aggregate_evaluate(server_round, results, failures)
-
-        # Save results to file
-        if aggregated_loss is not None and aggregated_metrics is not None:
-            with open("simulation_summary.txt", "a") as f:
-                f.write(f"Round {server_round}:\n")
-                f.write(f"  Loss: {aggregated_loss}\n")
-                for metric, value in aggregated_metrics.items():
-                    f.write(f"    {metric}: {value}\n")
-                f.write("\n")
-        
-        return aggregated_loss, aggregated_metrics
 
     def aggregate_fit(
         self,
@@ -121,107 +75,36 @@ class SaveResultsStrategy(FedProx):
         results: List[Tuple[fl.server.client_proxy.ClientProxy, fl.common.FitRes]],
         failures: List[BaseException],
     ) -> Tuple[fl.common.Parameters, Dict[str, fl.common.Scalar]]:
-        round_start = time.time()
         aggregated_parameters, aggregated_metrics = super().aggregate_fit(server_round, results, failures)
+        # Stash latest weights for post-training inference
         try:
             if aggregated_parameters is not None:
                 self.latest_parameters = aggregated_parameters
         except Exception:
             pass
+        # Collect and log minimal metrics
         try:
-            total_examples = 0
-            sum_loss = 0.0
-            client_losses = []
-            client_recon_time = []
-            client_recon_freq = []
-            # Step-level stats collectors (we aggregate means across clients)
-            step_time_means = []
-            step_freq_means = []
-            client_times = []
-            client_peak_mem = []
+            per_client_logs: Dict[str, float] = {}
+            client_times: List[float] = []
             wb_cfg = self._wb_cfg
             max_logged = int(wb_cfg.get("max_logged_clients", 32))
             per_client = bool(wb_cfg.get("log_per_client", True))
-            per_client_logs = {}
+            logged_clients = 0
             for cp, fr in results:
                 cid = getattr(cp, "cid", None)
                 m = getattr(fr, "metrics", {}) or {}
-                n = int(getattr(fr, "num_examples", 0))
-                if "train_loss" in m and isinstance(m["train_loss"], (int, float)):
-                    total_examples += n
-                    sum_loss += float(m["train_loss"]) * n
-                    if len(client_losses) < max_logged:
-                        client_losses.append(float(m["train_loss"]))
-                        if per_client and cid is not None:
-                            per_client_logs[f"client/{cid}/loss"] = float(m["train_loss"])
-                if "recon_time" in m and isinstance(m["recon_time"], (int, float)) and len(client_recon_time) < max_logged:
-                    client_recon_time.append(float(m["recon_time"]))
-                    if per_client and cid is not None:
-                        per_client_logs[f"client/{cid}/recon_time"] = float(m["recon_time"])
-                if "recon_freq" in m and isinstance(m["recon_freq"], (int, float)) and len(client_recon_freq) < max_logged:
-                    client_recon_freq.append(float(m["recon_freq"]))
-                    if per_client and cid is not None:
-                        per_client_logs[f"client/{cid}/recon_freq"] = float(m["recon_freq"])
-                # Step-level stats (flattened from client metrics)
-                if "recon_time_step/mean" in m and len(step_time_means) < max_logged:
-                    try:
-                        step_time_means.append(float(m["recon_time_step/mean"]))
-                        if per_client and cid is not None:
-                            per_client_logs[f"client/{cid}/recon_time_step_mean"] = float(m["recon_time_step/mean"])
-                            per_client_logs[f"client/{cid}/recon_time_step_last"] = float(m.get("recon_time_step/last", 0.0))
-                    except Exception:
-                        pass
-                if "recon_freq_step/mean" in m and len(step_freq_means) < max_logged:
-                    try:
-                        step_freq_means.append(float(m["recon_freq_step/mean"]))
-                        if per_client and cid is not None:
-                            per_client_logs[f"client/{cid}/recon_freq_step_mean"] = float(m["recon_freq_step/mean"])
-                            per_client_logs[f"client/{cid}/recon_freq_step_last"] = float(m.get("recon_freq_step/last", 0.0))
-                    except Exception:
-                        pass
-                if "train_time_s" in m and isinstance(m["train_time_s"], (int, float)) and len(client_times) < max_logged:
+                if isinstance(m.get("train_loss"), (int, float)) and per_client and cid is not None and logged_clients < max_logged:
+                    per_client_logs[f"client/{cid}/loss"] = float(m["train_loss"])  # per-client loss
+                    logged_clients += 1
+                if isinstance(m.get("train_time_s"), (int, float)):
                     client_times.append(float(m["train_time_s"]))
-                    if per_client and cid is not None:
-                        per_client_logs[f"client/{cid}/time_s"] = float(m["train_time_s"])
-                if "train_peak_mem_bytes" in m and isinstance(m["train_peak_mem_bytes"], (int, float)) and len(client_peak_mem) < max_logged:
-                    client_peak_mem.append(float(m["train_peak_mem_bytes"]))
-                    if per_client and cid is not None:
-                        per_client_logs[f"client/{cid}/peak_mem_mb"] = float(m["train_peak_mem_bytes"]) / 1e6
-            if total_examples > 0:
-                avg_loss = sum_loss / float(total_examples)
-                if isinstance(aggregated_metrics, dict):
-                    aggregated_metrics["train_loss"] = float(avg_loss)
-                log_dict = {"train/avg_loss": float(avg_loss), "train/clients_used": float(len(results))}
-                if client_losses:
-                    log_dict["clients/loss_mean"] = float(np.mean(client_losses))
-                    log_dict["clients/loss_std"] = float(np.std(client_losses))
-                if client_recon_time:
-                    log_dict["clients/recon_time_mean"] = float(np.mean(client_recon_time))
-                    log_dict["clients/recon_time_std"] = float(np.std(client_recon_time))
-                if client_recon_freq:
-                    log_dict["clients/recon_freq_mean"] = float(np.mean(client_recon_freq))
-                    log_dict["clients/recon_freq_std"] = float(np.std(client_recon_freq))
-                if step_time_means:
-                    log_dict["clients/recon_time_step_mean_mean"] = float(np.mean(step_time_means))
-                    log_dict["clients/recon_time_step_mean_std"] = float(np.std(step_time_means))
-                if step_freq_means:
-                    log_dict["clients/recon_freq_step_mean_mean"] = float(np.mean(step_freq_means))
-                    log_dict["clients/recon_freq_step_mean_std"] = float(np.std(step_freq_means))
-                if client_times:
-                    log_dict["clients/time_mean_s"] = float(np.mean(client_times))
-                    log_dict["clients/time_std_s"] = float(np.std(client_times))
-                if client_peak_mem:
-                    log_dict["clients/peak_mem_mean_mb"] = float(np.mean(client_peak_mem) / 1e6)
-                    log_dict["clients/peak_mem_max_mb"] = float(np.max(client_peak_mem) / 1e6)
-                if bool(wb_cfg.get("log_round_timing", True)):
-                    log_dict["round/duration_s"] = float(time.time() - round_start)
-                if bool(wb_cfg.get("log_gpu_memory", True)) and torch.cuda.is_available():
-                    try:
-                        log_dict["server/gpu_mem_alloc_mb"] = float(torch.cuda.memory_allocated() / 1e6)
-                    except Exception:
-                        pass
-                # Merge per-client logs (already capped)
-                log_dict.update(per_client_logs)
+            log_dict: Dict[str, float] = {}
+            if client_times:
+                import numpy as _np
+                log_dict["clients/time_mean_s"] = float(_np.mean(client_times))
+                log_dict["clients/time_std_s"] = float(_np.std(client_times))
+            log_dict.update(per_client_logs)
+            if log_dict:
                 log_metrics(log_dict, step=server_round)
         except Exception:
             pass
@@ -273,10 +156,9 @@ def main():
     print(f"Ray resources: {ray.available_resources()}")
 
     # Determine if we are in SMD by_machine minimal server mode
-    smd_by_machine = (
-        str(DATA_CFG.get("dataset", "")).upper() == 'SMD' and
-        str(DATA_CFG.get("partition_mode", "dirichlet")).lower() == 'by_machine'
-    )
+    dataset_upper = str(DATA_CFG.get("dataset", "")).upper()
+    partition_mode = str(DATA_CFG.get("partition_mode", "sequential")).lower()
+    smd_by_machine = dataset_upper == 'SMD' and partition_mode == 'by_machine'
 
     # === Centralized Dataset Cache Build (Driver) ===
     if bool(DATA_CFG.get("centralized_cache", False)) and not smd_by_machine:
@@ -285,47 +167,30 @@ def main():
         dataset_name = str(DATA_CFG.get("dataset", "PSM"))
         seq_length_cfg = int(DATA_CFG.get("seq_length", 50))
         stride_cfg = int(DATA_CFG.get("step", 1))
+        cache_clients_cfg = DATA_CFG.get('cache_clients')
+        sim_num_clients = SIM_CFG.get('num_clients', 24)
+        if cache_clients_cfg is None:
+            num_clients_total = int(sim_num_clients)
+        else:
+            num_clients_total = int(cache_clients_cfg)
         meta_path = os.path.join(cache_dir, "cache_meta.json")
         if not os.path.exists(meta_path):
             print(f"[Server] Building centralized cache at {cache_dir} for dataset={dataset_name} seq_length={seq_length_cfg} stride={stride_cfg}...")
-            meta = build_central_cache(dataset_name, seq_length_cfg, stride_cfg, cache_dir)
-            print(f"[Server] Cache built: train_shape={meta['train_shape']} test_shape={meta['test_shape']}")
+            meta = build_central_cache(dataset_name, seq_length_cfg, stride_cfg, cache_dir, num_clients=num_clients_total)
+            print(f"[Server] Cache built with {meta['num_train_segments']} train segments, feature_dim={meta['feature_dim']}")
         else:
             meta = load_cache(cache_dir)
-            print(f"[Server] Reusing existing cache at {cache_dir}: train_shape={meta['train_shape']} test_shape={meta['test_shape']}")
+            print(f"[Server] Reusing existing cache at {cache_dir}: {meta}")
 
-        # Build / reuse partition indices file
-        part_seed = int(DATA_CFG.get("partition_seed", 42))
-        dirichlet_alpha = float(DATA_CFG.get("dirichlet_alpha", 0.5))
-        num_clients_total = int(SIM_CFG.get('num_clients', 24))
-        idx_path = os.path.join(cache_dir, "partitions.npy")
-        if not os.path.exists(idx_path):
-            print(f"[Server] Creating Dirichlet (alpha={dirichlet_alpha}) quantity partitions with seed={part_seed} for {num_clients_total} clients...")
-            rng = np.random.default_rng(part_seed)
-            N_train = int(meta['train_shape'][0])
-            proportions = rng.dirichlet(np.repeat(dirichlet_alpha, num_clients_total))
-            counts = np.round(proportions * N_train).astype(int)
-            counts[-1] = N_train - counts[:-1].sum()
-            indices = np.arange(N_train)
-            rng.shuffle(indices)
-            ptr = 0
-            client_indices = []
-            for c in counts:
-                client_indices.append(indices[ptr:ptr + c])
-                ptr += c
-            np.save(idx_path, np.array(client_indices, dtype=object))
-            print(f"[Server] Saved partition indices: {idx_path}")
-        else:
-            print(f"[Server] Using existing partition indices at {idx_path}")
-
-        # Export environment variables so client_fn/load_data can discover cache
         os.environ['DUALFLSIM_CACHE_DIR'] = cache_dir
-        os.environ['DUALFLSIM_PARTITIONS_FILE'] = idx_path
         os.environ['DUALFLSIM_CACHE_ENABLED'] = '1'
+        os.environ['DUALFLSIM_DATASET'] = dataset_name
+        os.environ['DUALFLSIM_NUM_CLIENTS'] = str(num_clients_total)
     else:
         os.environ.pop('DUALFLSIM_CACHE_DIR', None)
-        os.environ.pop('DUALFLSIM_PARTITIONS_FILE', None)
         os.environ.pop('DUALFLSIM_CACHE_ENABLED', None)
+        os.environ.pop('DUALFLSIM_DATASET', None)
+        os.environ.pop('DUALFLSIM_NUM_CLIENTS', None)
 
     # 2. Define the client resources to 4cpus + 1gpu
     # Use all 4 GPUs for clients during training for maximum parallelism
@@ -463,74 +328,29 @@ def main():
             aggregated_parameters = ndarrays_to_parameters(new_weights)
             aggregated_metrics: Dict[str, fl.common.Scalar] = {}
 
-            # Aggregate and log training loss to wandb if available
+            # Minimal logging only: per-client loss and mean/std of client train time
             try:
                 wb_cfg = self._wb_cfg if hasattr(self, '_wb_cfg') else {}
                 per_client = bool(wb_cfg.get("log_per_client", True))
                 max_logged = int(wb_cfg.get("max_logged_clients", 32))
-                total_examples = 0
-                sum_loss = 0.0
-                client_losses = []
-                client_recon_time = []
-                client_recon_freq = []
-                step_time_means = []
-                step_freq_means = []
-                per_client_logs = {}
+                per_client_logs: Dict[str, float] = {}
+                client_times: List[float] = []
+                logged_clients = 0
                 for cp, fr in filtered_results:
                     cid = getattr(cp, 'cid', None)
                     m = getattr(fr, 'metrics', {}) or {}
-                    n = int(getattr(fr, 'num_examples', 0))
-                    if 'train_loss' in m and isinstance(m['train_loss'], (int, float)):
-                        total_examples += n
-                        sum_loss += float(m['train_loss']) * n
-                        if len(client_losses) < max_logged:
-                            client_losses.append(float(m['train_loss']))
-                            if per_client and cid is not None:
-                                per_client_logs[f'client/{cid}/loss'] = float(m['train_loss'])
-                    if 'recon_time' in m and isinstance(m['recon_time'], (int, float)) and len(client_recon_time) < max_logged:
-                        client_recon_time.append(float(m['recon_time']))
-                        if per_client and cid is not None:
-                            per_client_logs[f'client/{cid}/recon_time'] = float(m['recon_time'])
-                    if 'recon_freq' in m and isinstance(m['recon_freq'], (int, float)) and len(client_recon_freq) < max_logged:
-                        client_recon_freq.append(float(m['recon_freq']))
-                        if per_client and cid is not None:
-                            per_client_logs[f'client/{cid}/recon_freq'] = float(m['recon_freq'])
-                    if 'recon_time_step/mean' in m and len(step_time_means) < max_logged:
-                        try:
-                            step_time_means.append(float(m['recon_time_step/mean']))
-                            if per_client and cid is not None:
-                                per_client_logs[f'client/{cid}/recon_time_step_mean'] = float(m['recon_time_step/mean'])
-                                per_client_logs[f'client/{cid}/recon_time_step_last'] = float(m.get('recon_time_step/last', 0.0))
-                        except Exception:
-                            pass
-                    if 'recon_freq_step/mean' in m and len(step_freq_means) < max_logged:
-                        try:
-                            step_freq_means.append(float(m['recon_freq_step/mean']))
-                            if per_client and cid is not None:
-                                per_client_logs[f'client/{cid}/recon_freq_step_mean'] = float(m['recon_freq_step/mean'])
-                                per_client_logs[f'client/{cid}/recon_freq_step_last'] = float(m.get('recon_freq_step/last', 0.0))
-                        except Exception:
-                            pass
-                if total_examples > 0:
-                    avg_loss = sum_loss / float(total_examples)
-                    aggregated_metrics['train_loss'] = float(avg_loss)
-                    log_dict = {'train/avg_loss': float(avg_loss), 'train/clients_used': float(len(filtered_results))}
-                    if client_losses:
-                        log_dict['clients/loss_mean'] = float(np.mean(client_losses))
-                        log_dict['clients/loss_std'] = float(np.std(client_losses))
-                    if client_recon_time:
-                        log_dict['clients/recon_time_mean'] = float(np.mean(client_recon_time))
-                        log_dict['clients/recon_time_std'] = float(np.std(client_recon_time))
-                    if client_recon_freq:
-                        log_dict['clients/recon_freq_mean'] = float(np.mean(client_recon_freq))
-                        log_dict['clients/recon_freq_std'] = float(np.std(client_recon_freq))
-                    if step_time_means:
-                        log_dict['clients/recon_time_step_mean_mean'] = float(np.mean(step_time_means))
-                        log_dict['clients/recon_time_step_mean_std'] = float(np.std(step_time_means))
-                    if step_freq_means:
-                        log_dict['clients/recon_freq_step_mean_mean'] = float(np.mean(step_freq_means))
-                        log_dict['clients/recon_freq_step_mean_std'] = float(np.std(step_freq_means))
-                    log_dict.update(per_client_logs)
+                    if isinstance(m.get('train_loss'), (int, float)) and per_client and cid is not None and logged_clients < max_logged:
+                        per_client_logs[f'client/{cid}/loss'] = float(m['train_loss'])
+                        logged_clients += 1
+                    if isinstance(m.get('train_time_s'), (int, float)):
+                        client_times.append(float(m['train_time_s']))
+                log_dict: Dict[str, float] = {}
+                if client_times:
+                    import numpy as _np
+                    log_dict['clients/time_mean_s'] = float(_np.mean(client_times))
+                    log_dict['clients/time_std_s'] = float(_np.std(client_times))
+                log_dict.update(per_client_logs)
+                if log_dict:
                     log_metrics(log_dict, step=server_round)
             except Exception:
                 pass
@@ -554,100 +374,7 @@ def main():
             self.latest_parameters = aggregated_parameters
             return aggregated_parameters, aggregated_metrics
 
-    # Server-side evaluation to centralize threshold sweep
-    eval_state: Dict[str, float] = {}
     total_rounds: int = int(SIM_CFG.get("total_rounds", 10))
-
-    def server_evaluate_fn(
-        server_round: int,
-        params: List,  # already a list of ndarrays provided by Flower
-        config: Dict[str, fl.common.Scalar],
-    ) -> Tuple[float, Dict[str, fl.common.Scalar]]:
-        # Evaluate every N rounds and on the final round if enabled
-        if not bool(EVAL_CFG.get("enabled", False)):
-            print(f"[Server] Skipping evaluation for round {server_round} (evaluate every 3 rounds & final round)")
-            return None
-        import os
-        # Give the server more CPU threads for evaluation
-        os.environ.setdefault("OMP_NUM_THREADS", "16")
-        os.environ.setdefault("MKL_NUM_THREADS", "16")
-        os.environ.setdefault("OPENBLAS_NUM_THREADS", "16")
-        os.environ.setdefault("NUMEXPR_NUM_THREADS", "16")
-        try:
-            torch.set_num_threads(int(os.environ.get("OMP_NUM_THREADS", "16")))
-        except Exception:
-            pass
-
-        # Prefer a GPU with enough free memory; fall back to CPU if none
-        # Avoid expandable_segments due to allocator asserts on some PyTorch builds
-        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:256,garbage_collection_threshold:0.8")
-        # Use the highest-index GPU (kept free by Ray) for server evaluation
-        if torch.cuda.is_available() and torch.cuda.device_count() >= 1:
-            device_index = torch.cuda.device_count() - 1
-            try:
-                torch.cuda.set_device(device_index)
-            except Exception:
-                pass
-            device = torch.device(f"cuda:{device_index}")
-        else:
-            device = torch.device("cpu")
-        print(f"[Server] Evaluating round {server_round} on central test set (device={device})...")
-        print(f"[Server DEBUG] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES','<unset>')}, cuda_count={torch.cuda.device_count()}")
-        # Rebuild model and load parameters
-        net = FederatedDualTF(time_model_args, freq_model_args)
-        # params is already a list of ndarrays; set directly
-        # If params contain non-finite values, skip evaluation
-        if any((not np.all(np.isfinite(a))) for a in params):
-            print("[Server] Skipping evaluation due to non-finite global parameters")
-            return None
-        set_weights(net, params)
-
-        # Use preloaded test loaders
-        testloader_time, testloader_freq = testloader_time_global, testloader_freq_global
-        print(f"[Server DEBUG] testloader_time length: {len(testloader_time.dataset)}")
-        print(f"[Server DEBUG] testloader_freq length: {len(testloader_freq.dataset)}")
-        assert len(testloader_time.dataset) > 0, "Time dataloader is empty!"
-        assert len(testloader_freq.dataset) > 0, "Freq dataloader is empty!"
-
-        # Evaluate using existing test() which handles both models and threshold sweep
-        # Use fast settings for periodic rounds; thorough on final round
-        is_final = (server_round == total_rounds)
-        thr_cnt = int(EVAL_CFG.get("num_thresholds_final", 1000)) if is_final else int(EVAL_CFG.get("num_thresholds_periodic", 256))
-        step_val = int(EVAL_CFG.get("step", 5))
-
-        loss, metrics = test(
-            net,
-            testloader_time,
-            testloader_freq,
-            device,
-            eval_state=eval_state,
-            min_consecutive=int(EVAL_CFG.get('min_consecutive', 10)),
-            num_thresholds=thr_cnt,
-            seq_length=int(EVAL_CFG.get('seq_length', 50)),
-            step=step_val,
-            threshold_quantile_range=tuple(EVAL_CFG.get('threshold_quantile_range', [0.01, 0.99])),
-            prefer_gpu_sweep=bool(EVAL_CFG.get('prefer_gpu_sweep', True)),
-        )
-        # Cleanup: free VRAM on the reserved eval GPU
-        try:
-            del net
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
-        except Exception:
-            pass
-        gc.collect()
-        print(f"[Server] Round {server_round} evaluation done: {metrics}")
-        # Log evaluation metrics to wandb
-        try:
-            to_log = {"server/loss": float(loss)}
-            for k, v in metrics.items():
-                if isinstance(v, (int, float)):
-                    to_log[f"server/{k}"] = float(v)
-            log_metrics(to_log, step=server_round)
-        except Exception:
-            pass
-        return float(loss), metrics
 
     # Define strategy (standard partial participation): choose by config
     strategy_type = str(STRAT_CFG.get("type", "scaffold")).lower()
@@ -660,9 +387,9 @@ def main():
             min_fit_clients=int(SIM_CFG.get('min_fit_clients', 6)),
             initial_parameters=parameters,
             on_fit_config_fn=fit_config,
-            evaluate_metrics_aggregation_fn=aggregate_metrics,
             proximal_mu=float(TRAINING_CFG.get('proximal_mu', 0.0)),
-            evaluate_fn=None if not bool(EVAL_CFG.get('enabled', False)) else server_evaluate_fn,
+            # Force-disable server-side evaluation
+            evaluate_fn=None,
             cfg_ref=cfg,
         )
     else:
@@ -674,11 +401,10 @@ def main():
             min_fit_clients=int(SIM_CFG.get('min_fit_clients', 6)),
             initial_parameters=parameters,
             on_fit_config_fn=fit_config,
-            evaluate_metrics_aggregation_fn=aggregate_metrics,
             # Disable FedProx term when running SCAFFOLD; keep 0.0 for clarity
             proximal_mu=0.0,
-            # Keep server evaluation controlled by EVAL_CFG.enabled; set evaluate_fn accordingly
-            evaluate_fn=None if not bool(EVAL_CFG.get('enabled', False)) else server_evaluate_fn,
+            # Force-disable server-side evaluation
+            evaluate_fn=None,
             cfg_ref=cfg,
         )
 
@@ -700,14 +426,6 @@ def main():
 
     sim_duration = time.time() - SIM_START_TIME
     print(f"Simulation finished in {sim_duration:.2f}s.")
-    try:
-        if bool(cfg.get("wandb", {}).get("log_total_sim_time", True)):
-            log_metrics({
-                "simulation/total_time_s": float(sim_duration),
-                "simulation/avg_round_time_s": float(sim_duration / max(1, total_rounds))
-            }, step=total_rounds)
-    except Exception:
-        pass
 
     # === POST-TRAINING ARRAY GENERATION ===
     print("\n=== Starting Post-Training Array Generation ===")
@@ -795,6 +513,7 @@ def main():
         else:
             print("[Post-Training] Generating evaluation arrays...")
             try:
+                infer_t0 = time.time()
                 time_path, freq_path, time_df, freq_df = generate_evaluation_arrays(
                     model=final_model,
                     testloader_time=testloader_time_global,
@@ -806,6 +525,11 @@ def main():
                     seq_length=int(POST_CFG.get('seq_length', seq_len)),
                     nest_length=int(POST_CFG.get('nest_length', nest_len)),
                 )
+                infer_dt = time.time() - infer_t0
+                try:
+                    log_metrics({"post/infer_time_s": float(infer_dt)}, step=total_rounds)
+                except Exception:
+                    pass
 
                 print(f"[Post-Training] Arrays saved to:")
                 print(f"  - Time array: {time_path}")
