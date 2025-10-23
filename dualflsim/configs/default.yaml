@@ -1,5 +1,5 @@
 # DualTF-FLSim default configuration
-
+# Settings for Ray, based on the server condition.
 ray:
   num_cpus: 32
   num_gpus: 4
@@ -52,7 +52,7 @@ data:
   # - sequential: contiguous time slices (PSM)
   # - by_machine: SMAP, MSL, SMD
   partition_mode: by_machine      # sequential | by_machine
-  time_batch_size: 64@R
+  time_batch_size: 64
   freq_batch_size: 32
   # seq_length MUST equal model.seq_len
   seq_length: 75
@@ -64,7 +64,7 @@ data:
   max_train_windows_per_client: null  # Optional cap per client (None for all)
   client_load_test: false             # If false, only server loads test set; clients load only their train slice
 
-evaluation:
+evaluation: # Basically we don't need this, so keep it false.
   enabled: false   # Keep false for by_machine minimal server role
   min_consecutive: 10
   num_thresholds_periodic: 256
@@ -82,12 +82,12 @@ scaffold:
 post_training:
   generate_arrays: true
   dataset: SMD   # Must match data.dataset for consistency
-  data_num: 0
+  data_num: 0 # if you wanna run different experiment on same dataset, use different data_num.
   seq_length: 75
   nest_length: 25
   build_server_test_after_training: true  # If true and by_machine mode, server will load all test files only after training for array generation, keep it true for by_machine mode.
 
-wandb:
+wandb: # I didn't change the wandb logic, so maybe this part can be refined, just maybe (it takes time) 
   enabled: False 
   project: DualTF-FLSim
   entity: null      # optional
